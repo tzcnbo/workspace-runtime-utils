@@ -9,8 +9,8 @@ const PROXY_API_KEY = "tzcnb";
 const MODEL_MAP: Record<string, string> = {
   "gpt-5.5": "openai/gpt-5.5",
   "claude-opus-4-7": "anthropic/claude-opus-4.7",
-  "claude-opus-4-6": "anthropic/claude-4.6-opus",
-  "claude-sonnet-4-6": "anthropic/claude-4.6-sonnet",
+  "claude-opus-4-6": "anthropic/claude-opus-4.6",
+  "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
   "claude-haiku-4-5": "anthropic/claude-haiku-4.5",
 };
 
@@ -763,4 +763,5 @@ router.post("/messages", async (req, res) => {
 
 export default router;
 export { MODEL_MAP, MODELS, isClaudeModel, isOpenAIModel, toOpenRouterModel };
+
 
