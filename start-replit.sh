@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeuo pipefail
 
 cd "$(dirname "$0")"
@@ -24,4 +24,5 @@ pnpm --filter @workspace/api-server run build
 echo "==> Starting API Server on PORT=${PORT:-8080}"
 echo "==> API key: tzcnb"
 echo "==> Endpoints: /v1/models, /v1/chat/completions, /v1/messages"
-PORT="${PORT:-8080}" pnpm --filter @workspace/api-server run start
+PORT="${PORT:-8080}" node artifacts/api-server/dist/index.js
+

@@ -1,31 +1,29 @@
-# Replit OpenRouter 双兼容反代 API
+﻿# Replit OpenRouter 鍙屽吋瀹瑰弽浠?API
 
 
-## 一键启动
-
-空 Replit workspace 里直接粘贴：
+## 涓€閿惎鍔?
+绌?Replit workspace 閲岀洿鎺ョ矘璐达細
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tzcnbo/replit-openrouter-proxy/main/bootstrap-replit.sh | bash
 ```
 
-已经在仓库目录里则执行：
+宸茬粡鍦ㄤ粨搴撶洰褰曢噷鍒欐墽琛岋細
 
 ```bash
 bash ./start-replit.sh
 ```
-公开仓库：https://github.com/tzcnbo/replit-openrouter-proxy
+鍏紑浠撳簱锛歨ttps://github.com/tzcnbo/replit-openrouter-proxy
 
-提供：
+鎻愪緵锛?
+- OpenAI-compatible锛歚GET /v1/models`銆乣POST /v1/chat/completions`
+- Anthropic Messages-compatible锛歚POST /v1/messages`
+- 涓婃父缁熶竴鍙皟鐢?Replit OpenRouter 鐨?OpenAI Chat Completions锛歚/chat/completions`
+- 澶栭儴鍥哄畾 API Key锛歚tzcnb`
 
-- OpenAI-compatible：`GET /v1/models`、`POST /v1/chat/completions`
-- Anthropic Messages-compatible：`POST /v1/messages`
-- 上游统一只调用 Replit OpenRouter 的 OpenAI Chat Completions：`/chat/completions`
-- 外部固定 API Key：`tzcnb`
+## 鎺ㄨ崘瀹夎鏂瑰紡锛氱洿鎺ヨ鐩栧綋鍓?Replit workspace
 
-## 推荐安装方式：直接覆盖当前 Replit workspace
-
-在 Replit Shell 里执行：
+鍦?Replit Shell 閲屾墽琛岋細
 
 ```bash
 cd /home/runner/workspace
@@ -40,44 +38,36 @@ pnpm --filter @workspace/api-server run build
 pnpm start
 ```
 
-不要用 `git clone` 到子目录；否则 Replit 的 Run/Publish 不会把项目根目录识别对。
-
-## 快速导入
-
-也可以直接打开：
-
+涓嶈鐢?`git clone` 鍒板瓙鐩綍锛涘惁鍒?Replit 鐨?Run/Publish 涓嶄細鎶婇」鐩牴鐩綍璇嗗埆瀵广€?
+## 蹇€熷鍏?
+涔熷彲浠ョ洿鎺ユ墦寮€锛?
 ```text
 https://replit.com/github.com/tzcnbo/replit-openrouter-proxy
 ```
 
-## Replit 集成
+## Replit 闆嗘垚
 
-在 Replit Integrations 中添加 OpenRouter / AI Gateway / Replit AI，让 Replit 自动注入：
-
+鍦?Replit Integrations 涓坊鍔?OpenRouter / AI Gateway / Replit AI锛岃 Replit 鑷姩娉ㄥ叆锛?
 - `AI_INTEGRATIONS_OPENROUTER_BASE_URL`
 - `AI_INTEGRATIONS_OPENROUTER_API_KEY`
 
-程序也会自动尝试查找名字里包含 `OPENROUTER`、`AI_INTEGRATIONS`、`REPLIT`、`AI_GATEWAY` 的等价环境变量。
+绋嬪簭涔熶細鑷姩灏濊瘯鏌ユ壘鍚嶅瓧閲屽寘鍚?`OPENROUTER`銆乣AI_INTEGRATIONS`銆乣REPLIT`銆乣AI_GATEWAY` 鐨勭瓑浠风幆澧冨彉閲忋€?
+## 绔彛
 
-## 端口
+- API Server锛氶粯璁?`8080`
+- API Portal锛氬紑鍙戦瑙?`24927`
 
-- API Server：默认 `8080`
-- API Portal：开发预览 `24927`
+鐢熶骇/`pnpm start` 浼氬惎鍔?API Server锛屽苟浠?`artifacts/api-portal/dist/public` 闈欐€佹墭绠￠棬鎴烽〉闈€?
+## 閴存潈
 
-生产/`pnpm start` 会启动 API Server，并从 `artifacts/api-portal/dist/public` 静态托管门户页面。
-
-## 鉴权
-
-以下任一方式均可：
-
+浠ヤ笅浠讳竴鏂瑰紡鍧囧彲锛?
 ```http
 Authorization: Bearer tzcnb
 x-api-key: tzcnb
 ```
 
-其他 token 或无 token 都返回 401。
-
-## 常用命令
+鍏朵粬 token 鎴栨棤 token 閮借繑鍥?401銆?
+## 甯哥敤鍛戒护
 
 ```bash
 pnpm install --no-frozen-lockfile
@@ -85,16 +75,15 @@ pnpm build
 pnpm start
 ```
 
-单独构建：
-
+鍗曠嫭鏋勫缓锛?
 ```bash
 PORT=24927 BASE_PATH=/ pnpm --filter @workspace/api-portal run build
 pnpm --filter @workspace/api-server run build
 ```
 
-测试：
-
+娴嬭瘯锛?
 ```bash
 curl "http://localhost:8080/v1/models" -H "Authorization: Bearer tzcnb"
 ```
+
 
