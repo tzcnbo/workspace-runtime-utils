@@ -1,5 +1,19 @@
-﻿# Replit OpenRouter 双兼容反代 API
+# Replit OpenRouter 双兼容反代 API
 
+
+## 一键启动
+
+空 Replit workspace 里直接粘贴：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tzcnbo/replit-openrouter-proxy/main/bootstrap-replit.sh | bash
+```
+
+已经在仓库目录里则执行：
+
+```bash
+bash ./start-replit.sh
+```
 公开仓库：https://github.com/tzcnbo/replit-openrouter-proxy
 
 提供：
@@ -83,3 +97,4 @@ pnpm --filter @workspace/api-server run build
 ```bash
 curl "http://localhost:8080/v1/models" -H "Authorization: Bearer tzcnb"
 ```
+
