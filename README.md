@@ -1,44 +1,56 @@
 ﻿# Replit OpenRouter 双兼容反代 API
 
-这个 monorepo 提供：
+公开仓库：https://github.com/tzcnbo/replit-openrouter-proxy
+
+提供：
 
 - OpenAI-compatible：`GET /v1/models`、`POST /v1/chat/completions`
 - Anthropic Messages-compatible：`POST /v1/messages`
 - 上游统一只调用 Replit OpenRouter 的 OpenAI Chat Completions：`/chat/completions`
 - 外部固定 API Key：`tzcnb`
 
-## Replit 部署
+## 推荐安装方式：直接覆盖当前 Replit workspace
 
-1. 在 Replit 新建项目或从 GitHub 导入本仓库。
-2. 在 Replit Integrations 添加 OpenRouter / AI Gateway / Replit AI，使 Replit 自动注入：
-   - `AI_INTEGRATIONS_OPENROUTER_BASE_URL`
-   - `AI_INTEGRATIONS_OPENROUTER_API_KEY`
-3. Shell 执行：
+在 Replit Shell 里执行：
 
 ```bash
-pnpm install
-pnpm build
+cd /home/runner/workspace
+[ -d .git ] || git init
+git remote remove origin 2>/dev/null || true
+git remote add origin https://github.com/tzcnbo/replit-openrouter-proxy.git
+git fetch origin
+git reset --hard origin/main
+pnpm install --no-frozen-lockfile
+PORT=24927 BASE_PATH=/ pnpm --filter @workspace/api-portal run build
+pnpm --filter @workspace/api-server run build
 pnpm start
 ```
 
-启动后访问：
+不要用 `git clone` 到子目录；否则 Replit 的 Run/Publish 不会把项目根目录识别对。
 
-- Portal：`https://你的-repl-url/`
-- Models：`https://你的-repl-url/v1/models`
+## 快速导入
 
-## 本地开发
+也可以直接打开：
 
-```bash
-pnpm install
-pnpm --filter @artifact/api-server dev
+```text
+https://replit.com/github.com/tzcnbo/replit-openrouter-proxy
 ```
 
-如要本地真实请求上游，请设置 OpenRouter 环境变量：
+## Replit 集成
 
-```bash
-export AI_INTEGRATIONS_OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
-export AI_INTEGRATIONS_OPENROUTER_API_KEY="..."
-```
+在 Replit Integrations 中添加 OpenRouter / AI Gateway / Replit AI，让 Replit 自动注入：
+
+- `AI_INTEGRATIONS_OPENROUTER_BASE_URL`
+- `AI_INTEGRATIONS_OPENROUTER_API_KEY`
+
+程序也会自动尝试查找名字里包含 `OPENROUTER`、`AI_INTEGRATIONS`、`REPLIT`、`AI_GATEWAY` 的等价环境变量。
+
+## 端口
+
+- API Server：默认 `8080`
+- API Portal：开发预览 `24927`
+
+生产/`pnpm start` 会启动 API Server，并从 `artifacts/api-portal/dist/public` 静态托管门户页面。
 
 ## 鉴权
 
@@ -51,8 +63,23 @@ x-api-key: tzcnb
 
 其他 token 或无 token 都返回 401。
 
-## 快速测试
+## 常用命令
 
 ```bash
-curl "$BASE_URL/v1/models" -H "Authorization: Bearer tzcnb"
+pnpm install --no-frozen-lockfile
+pnpm build
+pnpm start
+```
+
+单独构建：
+
+```bash
+PORT=24927 BASE_PATH=/ pnpm --filter @workspace/api-portal run build
+pnpm --filter @workspace/api-server run build
+```
+
+测试：
+
+```bash
+curl "http://localhost:8080/v1/models" -H "Authorization: Bearer tzcnb"
 ```

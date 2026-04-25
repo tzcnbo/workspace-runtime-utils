@@ -1,8 +1,58 @@
-﻿run = "pnpm install && pnpm build && pnpm start"
-modules = ["nodejs-20", "web"]
+﻿modules = ["nodejs-24"]
 
-[nix]
-channel = "stable-24_05"
+[[artifacts]]
+id = "artifacts/api-server"
+
+[[artifacts]]
+id = "artifacts/api-portal"
 
 [deployment]
-run = ["sh", "-c", "pnpm install && pnpm build && pnpm start"]
+router = "application"
+deploymentTarget = "autoscale"
+build = ["sh", "-c", "pnpm --filter @workspace/api-portal run build && pnpm --filter @workspace/api-server run build"]
+run = ["sh", "-c", "pnpm --filter @workspace/api-server run start"]
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "artifacts/api-server: API Server"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "artifacts/api-portal: API Portal"
+
+[[workflows.workflow]]
+name = "artifacts/api-server: API Server"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=8080 pnpm --filter @workspace/api-server run dev"
+waitForPort = 8080
+
+[[workflows.workflow]]
+name = "artifacts/api-portal: API Portal"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=24927 BASE_PATH=/ API_TARGET=http://localhost:8080 pnpm --filter @workspace/api-portal run dev"
+waitForPort = 24927
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true

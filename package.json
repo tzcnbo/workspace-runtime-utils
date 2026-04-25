@@ -1,14 +1,13 @@
 ﻿{
-  "name": "replit-openrouter-proxy-monorepo",
+  "name": "workspace",
   "private": true,
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "pnpm --filter @artifact/api-server dev",
-    "dev:all": "pnpm --parallel -r dev",
-    "build": "pnpm -r build",
-    "start": "pnpm --filter @artifact/api-server start",
-    "portal:dev": "pnpm --filter @artifact/api-portal dev"
+    "build": "pnpm --filter @workspace/api-portal run build && pnpm --filter @workspace/api-server run build",
+    "start": "pnpm --filter @workspace/api-server run start",
+    "dev": "pnpm --parallel --filter @workspace/api-server --filter @workspace/api-portal run dev",
+    "portal:dev": "PORT=24927 BASE_PATH=/ API_TARGET=http://localhost:8080 pnpm --filter @workspace/api-portal run dev"
   },
   "engines": {
     "node": ">=20"

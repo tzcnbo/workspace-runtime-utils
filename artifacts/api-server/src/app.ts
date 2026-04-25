@@ -36,8 +36,11 @@ app.use("/v1", proxyRouter);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const portalDistCandidates = [
+  path.resolve(process.cwd(), "../api-portal/dist/public"),
   path.resolve(process.cwd(), "../api-portal/dist"),
+  path.resolve(__dirname, "../../api-portal/dist/public"),
   path.resolve(__dirname, "../../api-portal/dist"),
+  path.resolve(__dirname, "../../../api-portal/dist/public"),
   path.resolve(__dirname, "../../../api-portal/dist"),
 ];
 const portalDist = portalDistCandidates.find((candidate) => fs.existsSync(path.join(candidate, "index.html")));
@@ -50,4 +53,5 @@ if (portalDist) {
 }
 
 export default app;
+
 
