@@ -5,7 +5,7 @@
   "private": true,
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "node ../../scripts/ensure-dev-deps.mjs && tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:bundle": "node ./build.mjs",
     "build": "pnpm run typecheck && pnpm run build:bundle",
