@@ -166,9 +166,9 @@ Anthropic：
 对外模型 ID → OpenRouter 上游模型 ID
 
 - gpt-5.5 → openai/gpt-5.5
-- claude-opus-4-7 → anthropic/claude-4.7-opus
-- claude-opus-4-6 → anthropic/claude-4.6-opus
-- claude-sonnet-4-6 → anthropic/claude-4.6-sonnet
+- claude-opus-4-7 → anthropic/claude-opus-4.7
+- claude-opus-4-6 → anthropic/claude-opus-4.6
+- claude-sonnet-4-6 → anthropic/claude-sonnet-4.6
 - claude-haiku-4-5 → anthropic/claude-haiku-4.5
 
 如果 Replit OpenRouter 对某些模型 ID 使用不同命名：
@@ -220,7 +220,7 @@ Anthropic：
 
 重要事实：
 - claude-opus-4-7 对外作为本反代暴露的模型 ID。
-- 转发到 OpenRouter 上游时，将 claude-opus-4-7 映射为 OpenRouter 模型 ID：anthropic/claude-4.7-opus。
+- 转发到 OpenRouter 上游时，将 claude-opus-4-7 映射为 OpenRouter 模型 ID：anthropic/claude-opus-4.7。
 - Claude Opus 4.7 只支持 adaptive thinking。
 - Claude Opus 4.7 的 reasoning 是 opt-in，必须显式启用才会使用 reasoning。
 - 严禁向 Claude Opus 4.7 上游发送 thinking: { type: "enabled", budget_tokens: ... }。
@@ -236,7 +236,7 @@ OpenRouter 上游请求规则：
 当目标模型是 claude-opus-4-7 时：
 
 1. 将 model 改写为：
-   "anthropic/claude-4.7-opus"
+   "anthropic/claude-opus-4.7"
 
 2. 如果用户请求中没有显式提供 reasoning 或 thinking 配置，则自动注入：
 
@@ -361,7 +361,7 @@ OpenAI 兼容响应中：
 POST /v1/chat/completions 中 claude-opus-4-7 默认上游请求示例：
 
 {
-  "model": "anthropic/claude-4.7-opus",
+  "model": "anthropic/claude-opus-4.7",
   "messages": [
     { "role": "user", "content": "你好" }
   ],
@@ -477,7 +477,7 @@ Claude 模型缓存规则：
 - 对 claude-opus-4-7 的最终 OpenRouter payload 应至少包含：
 
 {
-  "model": "anthropic/claude-4.7-opus",
+  "model": "anthropic/claude-opus-4.7",
   "provider": {
     "order": ["anthropic"],
     "require_parameters": true
@@ -565,7 +565,7 @@ POST /v1/messages 缓存适配：
 转换为 OpenRouter 上游 OpenAI-compatible 请求：
 
 {
-  "model": "anthropic/claude-4.7-opus",
+  "model": "anthropic/claude-opus-4.7",
   "cache_control": { "type": "ephemeral" },
   "reasoning": { "enabled": true },
   "verbosity": "xhigh",
@@ -744,7 +744,7 @@ finish_reason / stop_reason 映射：
 上游响应如果已经是 OpenAI Chat Completions 格式：
 - 尽量原样返回。
 - 但要把 model 字段从 OpenRouter 模型 ID 改回用户请求的对外模型 ID。
-- 例如 anthropic/claude-4.7-opus → claude-opus-4-7。
+- 例如 anthropic/claude-opus-4.7 → claude-opus-4-7。
 - 如有必要，保留 upstream_model 字段用于调试，但不要破坏 OpenAI 标准格式。
 
 【POST /v1/chat/completions 流式】
@@ -943,7 +943,7 @@ metadata：
 转换为 OpenRouter OpenAI-compatible 上游请求：
 
 {
-  "model": "anthropic/claude-4.7-opus",
+  "model": "anthropic/claude-opus-4.7",
   "max_tokens": 4096,
   "reasoning": {
     "enabled": true
@@ -1631,7 +1631,7 @@ curl -N localhost:80/v1/messages \
 9. 验证 Claude Opus 4.7 自适应思考：
 
 对 claude-opus-4-7 的上游请求必须包含：
-- model: "anthropic/claude-4.7-opus"
+- model: "anthropic/claude-opus-4.7"
 - reasoning: { enabled: true }
 - verbosity: "xhigh"
 

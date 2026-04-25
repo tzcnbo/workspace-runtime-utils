@@ -1,6 +1,6 @@
-﻿import { Router } from "express";
+import { Router } from "express";
 import type { NextFunction, Request, Response as ExpressResponse } from "express";
-import { Readable } from "node:stream";
+import { once } from "node:events";
 import crypto from "node:crypto";
 
 const router = Router();
@@ -297,13 +297,22 @@ function adaptGenericClaudeThinking(payload: JsonObject): void {
 }
 
 function adaptClaudePayload(payload: JsonObject, req: Request, externalModel: string): void {
+  const explicitReasoningDisabledBeforeAdapt =
+    payload.include_reasoning === false ||
+    (isObject(payload.reasoning) && payload.reasoning.enabled === false) ||
+    (isObject(payload.thinking) && payload.thinking.type === "disabled");
+
   mergeProviderForClaude(payload);
   applyClaudePromptCaching(payload, req);
   if (externalModel === "claude-opus-4-7") adaptClaudeOpus47Thinking(payload);
   else adaptGenericClaudeThinking(payload);
 
   const reasoning = isObject(payload.reasoning) ? payload.reasoning : {};
-  const reasoningDisabled = reasoning.enabled === false || reasoning.exclude === true || payload.include_reasoning === false;
+  const reasoningDisabled =
+    explicitReasoningDisabledBeforeAdapt ||
+    reasoning.enabled === false ||
+    reasoning.exclude === true ||
+    payload.include_reasoning === false;
   if (!reasoningDisabled && !hasOwn(payload, "include_reasoning")) {
     payload.include_reasoning = true;
   }
@@ -376,6 +385,33 @@ function anthropicToolUseToOpenAI(block: JsonObject): JsonObject {
   };
 }
 
+function anthropicThinkingToReasoningDetail(block: JsonObject, index: number): JsonObject | undefined {
+  if (block.type === "thinking") {
+    const text = typeof block.thinking === "string" ? block.thinking : typeof block.text === "string" ? block.text : "";
+    if (!text) return undefined;
+    return {
+      type: "reasoning.text",
+      text,
+      signature: block.signature ?? null,
+      format: "anthropic-claude-v1",
+      index,
+    };
+  }
+
+  if (block.type === "redacted_thinking") {
+    const data = typeof block.data === "string" ? block.data : "";
+    if (!data) return undefined;
+    return {
+      type: "reasoning.encrypted",
+      data,
+      format: "anthropic-claude-v1",
+      index,
+    };
+  }
+
+  return undefined;
+}
+
 function convertAnthropicMessage(message: JsonObject): JsonObject[] {
   const role = message.role === "assistant" ? "assistant" : "user";
   const content = message.content;
@@ -384,6 +420,7 @@ function convertAnthropicMessage(message: JsonObject): JsonObject[] {
   const normalBlocks: any[] = [];
   const toolCalls: JsonObject[] = [];
   const toolResultMessages: JsonObject[] = [];
+  const reasoningDetails: JsonObject[] = [];
 
   for (const block of content) {
     if (isObject(block) && block.type === "tool_use") { toolCalls.push(anthropicToolUseToOpenAI(block)); continue; }
@@ -391,17 +428,26 @@ function convertAnthropicMessage(message: JsonObject): JsonObject[] {
       toolResultMessages.push({ role: "tool", tool_call_id: block.tool_use_id || block.id || "", content: stringifyToolResultContent(block.content) });
       continue;
     }
+    if (isObject(block) && (block.type === "thinking" || block.type === "redacted_thinking")) {
+      const detail = anthropicThinkingToReasoningDetail(block, reasoningDetails.length);
+      if (detail) reasoningDetails.push(detail);
+      continue;
+    }
     normalBlocks.push(convertAnthropicContentBlock(block));
   }
 
   const output: JsonObject[] = [];
-  if (normalBlocks.length > 0 || toolCalls.length > 0) {
+  if (normalBlocks.length > 0 || toolCalls.length > 0 || reasoningDetails.length > 0) {
     const canCollapseText = normalBlocks.length === 1 && isObject(normalBlocks[0]) && normalBlocks[0].type === "text" && !hasOwn(normalBlocks[0], "cache_control");
-    const openAIMessage: JsonObject = { role: toolCalls.length > 0 ? "assistant" : role, content: canCollapseText ? normalBlocks[0].text : normalBlocks };
+    const openAIMessage: JsonObject = {
+      role: toolCalls.length > 0 ? "assistant" : role,
+      content: normalBlocks.length === 0 ? "" : canCollapseText ? normalBlocks[0].text : normalBlocks,
+    };
     if (toolCalls.length > 0) {
       openAIMessage.tool_calls = toolCalls;
       if (normalBlocks.length === 0) openAIMessage.content = "";
     }
+    if (reasoningDetails.length > 0) openAIMessage.reasoning_details = reasoningDetails;
     output.push(openAIMessage);
   }
   output.push(...toolResultMessages);
@@ -441,6 +487,7 @@ function prepareAnthropicMessagesPayload(body: any, req: Request): { payload: Js
   for (const [key, value] of Object.entries(body)) {
     if (!omit.has(key)) payload[key] = clone(value);
   }
+  if (hasOwn(payload, "max_tokens") && hasOwn(payload, "max_completion_tokens")) delete payload.max_tokens;
 
   payload.model = toOpenRouterModel(externalModel);
   payload.messages = [
@@ -482,13 +529,28 @@ function mapUsageToAnthropic(usage: any): JsonObject {
   return mapped;
 }
 
-function parseToolArguments(raw: any): JsonObject {
-  if (typeof raw !== "string" || raw.length === 0) return {};
+function normalizeOpenAIUsageCacheFields(json: JsonObject): JsonObject {
+  if (!isObject(json.usage)) return json;
+  const usage = json.usage;
+  const promptDetails = isObject(usage.prompt_tokens_details) ? { ...usage.prompt_tokens_details } : {};
+
+  if (usage.cache_read_input_tokens !== undefined && promptDetails.cached_tokens === undefined) {
+    promptDetails.cached_tokens = usage.cache_read_input_tokens;
+  }
+  if (usage.cache_creation_input_tokens !== undefined && promptDetails.cache_write_tokens === undefined) {
+    promptDetails.cache_write_tokens = usage.cache_creation_input_tokens;
+  }
+  if (Object.keys(promptDetails).length > 0) usage.prompt_tokens_details = promptDetails;
+  return json;
+}
+
+function parseToolArguments(raw: any): { input: JsonObject; raw_arguments?: string } {
+  if (typeof raw !== "string" || raw.length === 0) return { input: {} };
   try {
     const parsed = JSON.parse(raw);
-    return isObject(parsed) ? parsed : { value: parsed };
+    return { input: isObject(parsed) ? parsed : { value: parsed } };
   } catch {
-    return { raw_arguments: raw };
+    return { input: {}, raw_arguments: raw };
   }
 }
 
@@ -547,11 +609,13 @@ function openAIResponseToAnthropic(json: JsonObject, externalModel: string): Jso
 
   if (Array.isArray(message.tool_calls)) {
     for (const call of message.tool_calls) {
+      const parsedArguments = parseToolArguments(call.function?.arguments);
       content.push({
         type: "tool_use",
         id: call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`,
         name: call.function?.name || "tool",
-        input: parseToolArguments(call.function?.arguments),
+        input: parsedArguments.input,
+        ...(parsedArguments.raw_arguments ? { raw_arguments: parsedArguments.raw_arguments } : {}),
       });
     }
   }
@@ -581,9 +645,14 @@ async function fetchOpenRouterJson(payload: JsonObject, req: Request): Promise<J
 
 async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressResponse): Promise<void> {
   const abort = new AbortController();
-  req.on("aborted", () => abort.abort());
+  let clientClosed = false;
+  const markClientClosed = () => {
+    clientClosed = true;
+    abort.abort();
+  };
+  req.on("aborted", markClientClosed);
   res.on("close", () => {
-    if (!res.writableEnded) abort.abort();
+    if (!res.writableEnded) markClientClosed();
   });
   const response = await callOpenRouterChatCompletions(payload, { signal: abort.signal });
   if (!response.ok) {
@@ -600,12 +669,29 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  await new Promise<void>((resolve, reject) => {
-    const nodeStream = Readable.fromWeb(response.body as any);
-    nodeStream.on("error", reject);
-    nodeStream.on("end", resolve);
-    nodeStream.pipe(res, { end: true });
-  });
+  const reader = response.body.getReader();
+  const keepAlive = setInterval(() => {
+    if (!clientClosed && !res.writableEnded) {
+      res.write(": keepalive\n\n");
+      (res as any).flush?.();
+    }
+  }, 5000);
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || clientClosed) break;
+      if (value?.length) {
+        const canContinue = res.write(Buffer.from(value));
+        (res as any).flush?.();
+        if (!canContinue) await once(res, "drain");
+      }
+    }
+    if (!clientClosed && !res.writableEnded) res.end();
+  } finally {
+    clearInterval(keepAlive);
+    reader.releaseLock();
+  }
 }
 
 async function* parseOpenAISSE(body: ReadableStream<Uint8Array>): AsyncGenerator<JsonObject> {
@@ -815,7 +901,12 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
     writeAnthropicSSE(res, "message_delta", {
       type: "message_delta",
       delta: { stop_reason: mapFinishReason(finishReason) || "end_turn", stop_sequence: null },
-      usage: { output_tokens: usage.output_tokens ?? 0 },
+      usage: {
+        output_tokens: usage.output_tokens ?? 0,
+        ...(usage.input_tokens !== undefined ? { input_tokens: usage.input_tokens } : {}),
+        ...(usage.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+        ...(usage.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}),
+      },
     });
     writeAnthropicSSE(res, "message_stop", { type: "message_stop" });
     res.end();
@@ -844,7 +935,7 @@ router.post("/chat/completions", async (req, res) => {
     }
     const json = await fetchOpenRouterJson(payload, req);
     if (json && typeof json === "object" && json.model) json.model = externalModel;
-    res.json(json);
+    res.json(normalizeOpenAIUsageCacheFields(json));
   } catch (error: any) {
     if (error instanceof HttpError) {
       const body = error.body || { error: { message: error.message, type: error.status >= 500 ? "server_error" : "invalid_request_error" } };
@@ -877,5 +968,3 @@ router.post("/messages", async (req, res) => {
 
 export default router;
 export { MODEL_MAP, MODELS, isClaudeModel, isOpenAIModel, toOpenRouterModel };
-
-

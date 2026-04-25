@@ -1,4 +1,4 @@
-﻿kind = "api"
+kind = "api"
 previewPath = "/api"
 title = "API Server"
 version = "1.0.0"
