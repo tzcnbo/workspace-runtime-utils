@@ -280,11 +280,19 @@ function adaptClaudeOpus47Thinking(payload: JsonObject): void {
 }
 
 function adaptGenericClaudeThinking(payload: JsonObject): void {
-  if (!hasOwn(payload, "thinking")) return;
+  const hadThinking = hasOwn(payload, "thinking");
+  const hadReasoning = hasOwn(payload, "reasoning");
   const thinking = isObject(payload.thinking) ? payload.thinking : undefined;
   const reasoning = isObject(payload.reasoning) ? { ...payload.reasoning } : {};
-  if (thinking?.type === "disabled") payload.reasoning = { ...reasoning, enabled: false };
-  else if (thinking?.type === "adaptive" || thinking?.type === "enabled") payload.reasoning = { ...reasoning, enabled: true };
+
+  if (reasoning.enabled === false || thinking?.type === "disabled") {
+    payload.reasoning = { ...reasoning, enabled: false };
+  } else if (thinking?.type === "adaptive" || thinking?.type === "enabled" || (!hadThinking && !hadReasoning)) {
+    payload.reasoning = { ...reasoning, enabled: true };
+  } else if (hadReasoning && Object.keys(reasoning).length > 0) {
+    payload.reasoning = reasoning;
+  }
+
   delete payload.thinking;
 }
 
@@ -293,6 +301,12 @@ function adaptClaudePayload(payload: JsonObject, req: Request, externalModel: st
   applyClaudePromptCaching(payload, req);
   if (externalModel === "claude-opus-4-7") adaptClaudeOpus47Thinking(payload);
   else adaptGenericClaudeThinking(payload);
+
+  const reasoning = isObject(payload.reasoning) ? payload.reasoning : {};
+  const reasoningDisabled = reasoning.enabled === false || reasoning.exclude === true || payload.include_reasoning === false;
+  if (!reasoningDisabled && !hasOwn(payload, "include_reasoning")) {
+    payload.include_reasoning = true;
+  }
 }
 
 function prepareOpenAIChatPayload(body: any, req: Request): { payload: JsonObject; externalModel: string } {
@@ -478,10 +492,51 @@ function parseToolArguments(raw: any): JsonObject {
   }
 }
 
+function reasoningDetailText(detail: any): string {
+  if (!isObject(detail)) return "";
+  if (typeof detail.text === "string") return detail.text;
+  if (typeof detail.summary === "string") return detail.summary;
+  if (typeof detail.reasoning === "string") return detail.reasoning;
+  if (typeof detail.content === "string") return detail.content;
+  return "";
+}
+
+function reasoningDetailToAnthropicBlock(detail: any): JsonObject | undefined {
+  if (!isObject(detail)) return undefined;
+  if (detail.type === "reasoning.encrypted" && typeof detail.data === "string") {
+    return { type: "redacted_thinking", data: detail.data };
+  }
+
+  const thinking = reasoningDetailText(detail);
+  if (!thinking) return undefined;
+
+  return {
+    type: "thinking",
+    thinking,
+    ...(detail.signature !== undefined ? { signature: detail.signature } : {}),
+  };
+}
+
+function collectAnthropicThinkingBlocks(message: JsonObject): JsonObject[] {
+  const blocks: JsonObject[] = [];
+  if (Array.isArray(message.reasoning_details)) {
+    for (const detail of message.reasoning_details) {
+      const block = reasoningDetailToAnthropicBlock(detail);
+      if (block) blocks.push(block);
+    }
+  }
+
+  if (blocks.length === 0 && typeof message.reasoning === "string" && message.reasoning.length > 0) {
+    blocks.push({ type: "thinking", thinking: message.reasoning });
+  }
+
+  return blocks;
+}
+
 function openAIResponseToAnthropic(json: JsonObject, externalModel: string): JsonObject {
   const choice = json.choices?.[0] || {};
   const message = choice.message || {};
-  const content: JsonObject[] = [];
+  const content: JsonObject[] = collectAnthropicThinkingBlocks(message);
 
   if (typeof message.content === "string" && message.content.length > 0) content.push({ type: "text", text: message.content });
   else if (Array.isArray(message.content)) {
@@ -598,6 +653,24 @@ function extractTextDelta(choice: any): string {
   return "";
 }
 
+function extractReasoningDeltas(choice: any): string[] {
+  const delta = choice?.delta || {};
+  const out: string[] = [];
+  const direct = [delta.reasoning, delta.reasoning_content, delta.thinking, delta.thinking_delta];
+  for (const value of direct) {
+    if (typeof value === "string" && value.length > 0) out.push(value);
+  }
+
+  if (Array.isArray(delta.reasoning_details)) {
+    for (const detail of delta.reasoning_details) {
+      const text = reasoningDetailText(detail);
+      if (text) out.push(text);
+    }
+  }
+
+  return out;
+}
+
 async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: ExpressResponse, externalModel: string): Promise<void> {
   const abort = new AbortController();
   let clientClosed = false;
@@ -627,12 +700,44 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   res.flushHeaders?.();
 
   const keepAlive = setInterval(() => { if (!clientClosed) writeAnthropicSSE(res, "ping", { type: "ping" }); }, 5000);
-  let textStarted = false;
+  let nextContentBlockIndex = 0;
+  let reasoningBlockIndex: number | undefined;
+  let reasoningStopped = false;
+  let textBlockIndex: number | undefined;
   let textStopped = false;
   let finishReason: string | null = null;
   let latestUsage: any = null;
   const toolBlocks = new Map<string, { blockIndex: number; stopped: boolean }>();
-  let nextToolBlockIndex = 1;
+
+  const startReasoningBlock = () => {
+    if (reasoningBlockIndex !== undefined) return reasoningBlockIndex;
+    reasoningBlockIndex = nextContentBlockIndex++;
+    writeAnthropicSSE(res, "content_block_start", {
+      type: "content_block_start",
+      index: reasoningBlockIndex,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    return reasoningBlockIndex;
+  };
+
+  const stopReasoningBlock = () => {
+    if (reasoningBlockIndex !== undefined && !reasoningStopped) {
+      reasoningStopped = true;
+      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: reasoningBlockIndex });
+    }
+  };
+
+  const startTextBlock = () => {
+    stopReasoningBlock();
+    if (textBlockIndex !== undefined) return textBlockIndex;
+    textBlockIndex = nextContentBlockIndex++;
+    writeAnthropicSSE(res, "content_block_start", {
+      type: "content_block_start",
+      index: textBlockIndex,
+      content_block: { type: "text", text: "" },
+    });
+    return textBlockIndex;
+  };
 
   try {
     writeAnthropicSSE(res, "message_start", {
@@ -654,13 +759,19 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
       if (chunk.usage) latestUsage = chunk.usage;
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       for (const choice of choices) {
+        for (const thinking of extractReasoningDeltas(choice)) {
+          const index = startReasoningBlock();
+          writeAnthropicSSE(res, "content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: { type: "thinking_delta", thinking },
+          });
+        }
+
         const text = extractTextDelta(choice);
         if (text) {
-          if (!textStarted) {
-            textStarted = true;
-            writeAnthropicSSE(res, "content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-          }
-          writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+          const index = startTextBlock();
+          writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } });
         }
 
         const toolCalls = choice?.delta?.tool_calls || choice?.message?.tool_calls;
@@ -669,7 +780,7 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
             const toolCall = toolCalls[i];
             const key = String(toolCall.index ?? toolCall.id ?? i);
             let state = toolBlocks.get(key);
-            const blockIndex = state?.blockIndex ?? nextToolBlockIndex++;
+            const blockIndex = state?.blockIndex ?? nextContentBlockIndex++;
             const id = toolCall.id || `call_${crypto.randomUUID().replace(/-/g, "")}`;
             const name = toolCall.function?.name || "tool";
             if (!state) {
@@ -688,9 +799,10 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
     }
 
     if (clientClosed) return;
-    if (textStarted && !textStopped) {
+    stopReasoningBlock();
+    if (textBlockIndex !== undefined && !textStopped) {
       textStopped = true;
-      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: 0 });
+      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: textBlockIndex });
     }
     for (const [, state] of toolBlocks) {
       if (!state.stopped) {
