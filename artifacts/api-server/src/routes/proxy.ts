@@ -158,8 +158,10 @@ function normalizeBaseUrl(baseUrl: string): string {
 
 function buildChatCompletionsUrl(baseUrl: string): string {
   const normalized = normalizeBaseUrl(baseUrl);
-  if (/\/(api\/)?v1$/i.test(normalized)) return `${normalized}/chat/completions`;
-  return `${normalized}/v1/chat/completions`;
+  // Replit AI/OpenRouter integrations inject an OpenAI-compatible base URL.
+  // Treat it exactly like the OpenAI SDK's baseURL: append the resource path
+  // only. Do not invent an extra /v1 segment for gateway/internal URLs.
+  return `${normalized}/chat/completions`;
 }
 
 function getOpenRouterConfig(): { url: string; apiKey: string } {
