@@ -1,0 +1,8 @@
+﻿run = "pnpm install && pnpm build && pnpm start"
+modules = ["nodejs-20", "web"]
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "pnpm install && pnpm build && pnpm start"]

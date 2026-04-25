@@ -1,0 +1,16 @@
+﻿{
+  "name": "replit-openrouter-proxy-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @artifact/api-server dev",
+    "dev:all": "pnpm --parallel -r dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @artifact/api-server start",
+    "portal:dev": "pnpm --filter @artifact/api-portal dev"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

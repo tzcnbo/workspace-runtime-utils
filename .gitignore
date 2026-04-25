@@ -1,0 +1,9 @@
+﻿node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.pnpm-store/
+.DS_Store
+.replit.nix
+coverage/

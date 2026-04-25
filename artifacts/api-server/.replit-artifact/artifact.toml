@@ -1,0 +1,4 @@
+﻿[artifact]
+name = "api-server"
+type = "node"
+paths = ["/api", "/v1"]
