@@ -986,22 +986,42 @@ function extractTextDelta(choice: any): string {
   return "";
 }
 
+function uniqueReasoningTexts(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
 function extractReasoningDeltas(choice: any): string[] {
   const delta = choice?.delta || {};
-  const out: string[] = [];
-  const direct = [delta.reasoning, delta.reasoning_content, delta.thinking, delta.thinking_delta];
-  for (const value of direct) {
-    if (typeof value === "string" && value.length > 0) out.push(value);
-  }
 
+  // OpenRouter/provider streams may expose the same thinking token under more
+  // than one alias in the same SSE chunk (for example reasoning and
+  // reasoning_content, or reasoning_details plus a direct field). Forwarding all
+  // aliases makes clients display word-by-word duplicates such as
+  // "The The initial initial". Prefer the structured reasoning_details form
+  // when it carries text, otherwise fall back to direct aliases with exact
+  // per-chunk de-duplication.
+  const detailTexts: string[] = [];
   if (Array.isArray(delta.reasoning_details)) {
     for (const detail of delta.reasoning_details) {
       const text = reasoningDetailText(detail);
-      if (text) out.push(text);
+      if (text) detailTexts.push(text);
     }
   }
+  if (detailTexts.length > 0) return uniqueReasoningTexts(detailTexts);
 
-  return out;
+  return uniqueReasoningTexts([
+    delta.reasoning,
+    delta.reasoning_content,
+    delta.thinking,
+    delta.thinking_delta,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0));
 }
 
 function reasoningDetailSignature(detail: any): string | undefined {
