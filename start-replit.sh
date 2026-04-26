@@ -13,12 +13,12 @@ ensure_node_and_pnpm() {
   if command -v node >/dev/null 2>&1 && command -v corepack >/dev/null 2>&1 && ! command -v pnpm >/dev/null 2>&1; then
     echo "==> pnpm not found, enabling via corepack"
     corepack enable
-    corepack prepare pnpm@10.32.1 --activate
+    corepack prepare pnpm@10.26.1 --activate
   fi
 
   if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && ! command -v pnpm >/dev/null 2>&1; then
     echo "==> pnpm not found, installing via npm"
-    npm install -g pnpm@10.32.1
+    npm install -g pnpm@10.26.1
   fi
 
   if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
