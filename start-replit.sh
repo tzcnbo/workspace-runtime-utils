@@ -6,22 +6,32 @@ cd "$(dirname "$0")"
 echo "==> Replit OpenRouter Proxy start"
 
 ensure_node_and_pnpm() {
-  if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
+  local wanted_pnpm="10.26.1"
+  local current_pnpm=""
+  if command -v pnpm >/dev/null 2>&1; then
+    current_pnpm="$(pnpm -v 2>/dev/null || true)"
+  fi
+
+  if command -v node >/dev/null 2>&1 && [ "$current_pnpm" = "$wanted_pnpm" ]; then
     return 0
   fi
 
-  if command -v node >/dev/null 2>&1 && command -v corepack >/dev/null 2>&1 && ! command -v pnpm >/dev/null 2>&1; then
-    echo "==> pnpm not found, enabling via corepack"
-    corepack enable
-    corepack prepare pnpm@10.26.1 --activate
+  if command -v node >/dev/null 2>&1 && command -v corepack >/dev/null 2>&1; then
+    echo "==> activating pnpm@$wanted_pnpm via corepack"
+    corepack enable || true
+    corepack prepare "pnpm@$wanted_pnpm" --activate || true
+    hash -r 2>/dev/null || true
+    current_pnpm="$(pnpm -v 2>/dev/null || true)"
   fi
 
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && ! command -v pnpm >/dev/null 2>&1; then
-    echo "==> pnpm not found, installing via npm"
-    npm install -g pnpm@10.26.1
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && [ "$current_pnpm" != "$wanted_pnpm" ]; then
+    echo "==> installing pnpm@$wanted_pnpm via npm"
+    npm install -g "pnpm@$wanted_pnpm"
+    hash -r 2>/dev/null || true
+    current_pnpm="$(pnpm -v 2>/dev/null || true)"
   fi
 
-  if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
+  if command -v node >/dev/null 2>&1 && [ "$current_pnpm" = "$wanted_pnpm" ]; then
     return 0
   fi
 

@@ -16,15 +16,37 @@ function run(command, args) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 
+function runPnpm(args) {
+  const currentPnpm = process.env.npm_execpath || "";
+  if (currentPnpm.toLowerCase().includes("pnpm")) {
+    run(process.execPath, [currentPnpm, ...args]);
+    return;
+  }
+  run("pnpm", args);
+}
+
+function copyRecursive(src, dest) {
+  const stat = fs.statSync(src);
+  if (stat.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyRecursive(resolve(src, entry), resolve(dest, entry));
+    }
+    return;
+  }
+  fs.mkdirSync(resolve(dest, ".."), { recursive: true });
+  fs.copyFileSync(src, dest);
+}
+
 fs.rmSync(deployDir, { recursive: true, force: true });
 
 run("node", ["scripts/write-static-portal.mjs"]);
-run("pnpm", ["--filter", "@workspace/api-server", "run", "build"]);
-run("pnpm", ["--filter", "@workspace/api-server", "deploy", "--prod", "--legacy", "artifacts/api-server/.deploy"]);
+runPnpm(["--filter", "@workspace/api-server", "run", "build"]);
+runPnpm(["--filter", "@workspace/api-server", "deploy", "--prod", "--legacy", "artifacts/api-server/.deploy"]);
 
 const portalDist = resolve(root, "artifacts/api-portal/dist/public");
 if (fs.existsSync(portalDist)) {
-  fs.cpSync(portalDist, resolve(deployDir, "public"), { recursive: true });
+  copyRecursive(portalDist, resolve(deployDir, "public"));
 }
 
 console.log("Built self-contained API server deploy bundle at artifacts/api-server/.deploy");
