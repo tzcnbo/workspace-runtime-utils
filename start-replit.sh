@@ -53,10 +53,10 @@ echo "==> pnpm: $(pnpm -v)"
 echo "==> Installing dependencies"
 CI=true pnpm install --no-frozen-lockfile
 
-echo "==> Building API Portal"
-PORT=24927 BASE_PATH=/ pnpm --filter @workspace/api-portal run build
+echo "==> Writing static API Portal"
+node scripts/write-static-portal.mjs
 
-echo "==> Building API Server"
+echo "==> Building API Server (tsc, no esbuild/vite)"
 pnpm --filter @workspace/api-server run build
 
 echo "==> Starting API Server on PORT=${PORT:-8080}"

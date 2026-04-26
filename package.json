@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "pnpm --filter @workspace/api-portal run build && pnpm --filter @workspace/api-server run build",
+    "build": "node scripts/write-static-portal.mjs && pnpm --filter @workspace/api-server run build",
     "start": "node artifacts/api-server/dist/index.js",
     "dev": "pnpm --parallel --filter @workspace/api-server --filter @workspace/api-portal run dev",
     "portal:dev": "PORT=24927 BASE_PATH=/ API_TARGET=http://localhost:8080 pnpm --filter @workspace/api-portal run dev"

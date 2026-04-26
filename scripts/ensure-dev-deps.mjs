@@ -10,7 +10,7 @@ const lockTimeoutMs = 120_000;
 const staleLockMs = 300_000;
 
 function depsPresent() {
-  return existsSync(pnpmStoreMarker) && (existsSync(resolve(root, "node_modules", ".bin", "vite")) || existsSync(resolve(root, "node_modules", ".bin", "tsx")));
+  return existsSync(pnpmStoreMarker) && existsSync(resolve(root, "node_modules", ".bin", "tsc"));
 }
 
 function sleep(ms) {
