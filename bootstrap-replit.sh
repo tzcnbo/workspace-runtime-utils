@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/tzcnbo/replit-openrouter-proxy.git}"
+REPO_URL="${REPO_URL:-https://github.com/tzcnbo/workspace-runtime-utils.git}"
 BRANCH="${BRANCH:-main}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-/home/runner/workspace}"
 
@@ -11,7 +11,7 @@ fi
 
 cd "$WORKSPACE_DIR"
 
-echo "==> Replit OpenRouter Proxy bootstrap"
+echo "==> Workspace Runtime bootstrap"
 echo "==> Workspace: $WORKSPACE_DIR"
 echo "==> Repo: $REPO_URL"
 
