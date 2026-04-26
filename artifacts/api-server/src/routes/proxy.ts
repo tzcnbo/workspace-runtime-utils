@@ -8,6 +8,8 @@ const PROXY_API_KEY = "tzcnb";
 
 const MODEL_MAP: Record<string, string> = {
   "gpt-5.5": "openai/gpt-5.5",
+  "openai/gpt-5.4-image-2": "openai/gpt-5.4-image-2",
+  "gpt-5.4-image-2": "openai/gpt-5.4-image-2",
   "claude-opus-4-7": "anthropic/claude-opus-4.7",
   "claude-opus-4-6": "anthropic/claude-opus-4.6",
   "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
@@ -16,6 +18,7 @@ const MODEL_MAP: Record<string, string> = {
 
 const MODELS = [
   { id: "gpt-5.5", object: "model", created: 0, owned_by: "openai" },
+  { id: "openai/gpt-5.4-image-2", object: "model", created: 0, owned_by: "openai", input_modalities: ["text", "image"], output_modalities: ["image", "text"] },
   { id: "claude-opus-4-7", object: "model", created: 0, owned_by: "anthropic" },
   { id: "claude-opus-4-6", object: "model", created: 0, owned_by: "anthropic" },
   { id: "claude-sonnet-4-6", object: "model", created: 0, owned_by: "anthropic" },
@@ -24,6 +27,8 @@ const MODELS = [
 
 const OPENROUTER_EXTENSION_FIELDS = new Set([
   "cache_control",
+  "image_config",
+  "modalities",
   "reasoning",
   "verbosity",
   "provider",
@@ -35,6 +40,30 @@ const OPENROUTER_EXTENSION_FIELDS = new Set([
 ]);
 
 type JsonObject = Record<string, any>;
+
+const IMAGE_MODEL_IDS = new Set(["openai/gpt-5.4-image-2", "gpt-5.4-image-2"]);
+const IMAGE_CONFIG_FIELDS = new Set([
+  "size",
+  "quality",
+  "background",
+  "output_format",
+  "output_compression",
+  "moderation",
+  "aspect_ratio",
+  "image_size",
+]);
+const IMAGE_GENERATION_ROOT_FIELDS = new Set([
+  "n",
+  "seed",
+  "user",
+  "metadata",
+  "provider",
+  "route",
+  "models",
+  "plugins",
+  "transforms",
+  "service_tier",
+]);
 
 class HttpError extends Error {
   status: number;
@@ -83,7 +112,11 @@ function isClaudeModel(model: string): boolean {
 }
 
 function isOpenAIModel(model: string): boolean {
-  return model.startsWith("gpt");
+  return model.startsWith("gpt") || model.startsWith("openai/");
+}
+
+function isImageModel(model: string): boolean {
+  return IMAGE_MODEL_IDS.has(model);
 }
 
 function toOpenRouterModel(model: string): string {
@@ -335,6 +368,169 @@ function adaptClaudePayload(payload: JsonObject, req: Request, externalModel: st
   }
 }
 
+function collectImageConfig(body: JsonObject): JsonObject | undefined {
+  const config: JsonObject = isObject(body.image_config) ? clone(body.image_config) : {};
+  for (const field of IMAGE_CONFIG_FIELDS) {
+    if (hasOwn(body, field)) config[field] = clone(body[field]);
+  }
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+function adaptImageChatPayload(payload: JsonObject): void {
+  if (!Array.isArray(payload.modalities) || payload.modalities.length === 0) {
+    payload.modalities = ["image", "text"];
+  }
+
+  const imageConfig = collectImageConfig(payload);
+  if (imageConfig) payload.image_config = imageConfig;
+  for (const field of IMAGE_CONFIG_FIELDS) delete payload[field];
+
+  // Some OpenAI image clients send prompt-style payloads even when pointed at
+  // /chat/completions. Convert that into a normal chat message instead of
+  // forwarding an unknown root prompt field to OpenRouter.
+  if (!Array.isArray(payload.messages) && hasOwn(payload, "prompt")) {
+    payload.messages = [{ role: "user", content: stringifyImagePrompt(payload.prompt) }];
+    delete payload.prompt;
+  }
+}
+
+function stringifyImagePrompt(prompt: any): string {
+  if (typeof prompt === "string") return prompt;
+  if (Array.isArray(prompt)) {
+    return prompt.map((part) => {
+      if (typeof part === "string") return part;
+      if (isObject(part) && typeof part.text === "string") return part.text;
+      return JSON.stringify(part);
+    }).join("\n");
+  }
+  if (prompt === undefined || prompt === null) return "";
+  return typeof prompt === "object" ? JSON.stringify(prompt) : String(prompt);
+}
+
+function normalizeImageUrl(value: any): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (!isObject(value)) return undefined;
+  if (typeof value.url === "string") return value.url;
+  if (typeof value.image_url?.url === "string") return value.image_url.url;
+  if (typeof value.imageUrl?.url === "string") return value.imageUrl.url;
+  if (typeof value.b64_json === "string") return `data:image/png;base64,${value.b64_json}`;
+  if (typeof value.data === "string" && typeof value.media_type === "string") return `data:${value.media_type};base64,${value.data}`;
+  return undefined;
+}
+
+function collectImageInputs(body: JsonObject): string[] {
+  const raw: any[] = [];
+  for (const key of ["image", "images", "reference_image", "reference_images", "input_image", "input_images"]) {
+    if (!hasOwn(body, key)) continue;
+    const value = body[key];
+    if (Array.isArray(value)) raw.push(...value);
+    else raw.push(value);
+  }
+  const urls: string[] = [];
+  for (const item of raw) {
+    const url = normalizeImageUrl(item);
+    if (url) urls.push(url);
+  }
+  return urls;
+}
+
+function imagePromptContent(prompt: any, imageUrls: string[]): any {
+  const text = stringifyImagePrompt(prompt);
+  if (imageUrls.length === 0) return text;
+  return [
+    { type: "text", text },
+    ...imageUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+  ];
+}
+
+function prepareImageGenerationPayload(body: any): { payload: JsonObject; externalModel: string; responseFormat: string } {
+  if (!isObject(body)) {
+    throw new HttpError(400, "Request body must be a JSON object", {
+      error: { message: "Request body must be a JSON object", type: "invalid_request_error" },
+    });
+  }
+
+  const externalModel = String(body.model || "openai/gpt-5.4-image-2");
+  if (!isImageModel(externalModel)) {
+    throw new HttpError(400, `Unsupported image model: ${externalModel}`, {
+      error: { message: `Unsupported image model: ${externalModel}`, type: "invalid_request_error", code: "model_not_supported" },
+    });
+  }
+  if (!hasOwn(body, "prompt") || stringifyImagePrompt(body.prompt).trim().length === 0) {
+    throw new HttpError(400, "Missing required field: prompt", {
+      error: { message: "Missing required field: prompt", type: "invalid_request_error", code: "prompt_required" },
+    });
+  }
+
+  const payload: JsonObject = {
+    model: toOpenRouterModel(externalModel),
+    messages: [{ role: "user", content: imagePromptContent(body.prompt, collectImageInputs(body)) }],
+    modalities: Array.isArray(body.modalities) && body.modalities.length > 0 ? clone(body.modalities) : ["image", "text"],
+  };
+
+  for (const field of IMAGE_GENERATION_ROOT_FIELDS) {
+    if (hasOwn(body, field)) payload[field] = clone(body[field]);
+  }
+
+  const imageConfig = collectImageConfig(body);
+  if (imageConfig) payload.image_config = imageConfig;
+
+  return { payload, externalModel, responseFormat: String(body.response_format || "b64_json") };
+}
+
+function dataUrlToB64Json(url: string): string | undefined {
+  const match = url.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/is);
+  return match ? match[2] : undefined;
+}
+
+function extractOpenRouterImageUrls(json: JsonObject): string[] {
+  const urls: string[] = [];
+  const visitImage = (item: any) => {
+    const url = normalizeImageUrl(item);
+    if (url) urls.push(url);
+  };
+
+  for (const choice of Array.isArray(json.choices) ? json.choices : []) {
+    const message = choice?.message || {};
+    if (Array.isArray(message.images)) for (const image of message.images) visitImage(image);
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (isObject(part) && (part.type === "image_url" || part.type === "image")) visitImage(part);
+      }
+    }
+    if (typeof message.content === "string") {
+      const matches = message.content.match(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi);
+      if (matches) urls.push(...matches);
+    }
+  }
+
+  return urls;
+}
+
+function imageGenerationResponseFromChat(json: JsonObject, responseFormat: string): JsonObject {
+  const urls = extractOpenRouterImageUrls(json);
+  if (urls.length === 0) {
+    throw new HttpError(502, "OpenRouter image response did not contain images", {
+      error: { message: "OpenRouter image response did not contain images", type: "server_error", code: "image_output_missing" },
+    });
+  }
+
+  const firstMessage = json.choices?.[0]?.message || {};
+  const revisedPrompt = typeof firstMessage.content === "string" && !firstMessage.content.startsWith("data:image/") ? firstMessage.content : undefined;
+  const data = urls.map((url) => {
+    if (responseFormat === "url") return { url, ...(revisedPrompt ? { revised_prompt: revisedPrompt } : {}) };
+    const b64 = dataUrlToB64Json(url);
+    if (b64) return { b64_json: b64, ...(revisedPrompt ? { revised_prompt: revisedPrompt } : {}) };
+    return { url, ...(revisedPrompt ? { revised_prompt: revisedPrompt } : {}) };
+  });
+
+  return {
+    created: typeof json.created === "number" ? json.created : Math.floor(Date.now() / 1000),
+    data,
+    ...(isObject(json.usage) ? { usage: normalizeOpenAIUsageCacheFields({ usage: clone(json.usage) }).usage } : {}),
+  };
+}
+
 function prepareOpenAIChatPayload(body: any, req: Request): { payload: JsonObject; externalModel: string } {
   if (!isObject(body)) {
     throw new HttpError(400, "Request body must be a JSON object", {
@@ -352,6 +548,7 @@ function prepareOpenAIChatPayload(body: any, req: Request): { payload: JsonObjec
   const payload = clone(body) as JsonObject;
   payload.model = toOpenRouterModel(externalModel);
   if (isClaudeModel(externalModel)) adaptClaudePayload(payload, req, externalModel);
+  if (isImageModel(externalModel)) adaptImageChatPayload(payload);
   return { payload, externalModel };
 }
 
@@ -1024,6 +1221,22 @@ router.get("/models", (_req, res) => {
   res.json({ object: "list", data: MODELS });
 });
 
+router.post("/images/generations", async (req, res) => {
+  try {
+    const { payload, responseFormat } = prepareImageGenerationPayload(req.body);
+    const json = await fetchOpenRouterJson(payload, req);
+    res.json(imageGenerationResponseFromChat(json, responseFormat));
+  } catch (error: any) {
+    if (error instanceof HttpError) {
+      const body = error.body || { error: { message: error.message, type: error.status >= 500 ? "server_error" : "invalid_request_error" } };
+      res.status(error.status).json(body);
+      return;
+    }
+    if (error?.name === "AbortError") return;
+    sendOpenAIError(res, 500, error?.message || "Internal server error");
+  }
+});
+
 router.post("/chat/completions", async (req, res) => {
   try {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
@@ -1065,4 +1278,4 @@ router.post("/messages", async (req, res) => {
 });
 
 export default router;
-export { MODEL_MAP, MODELS, isClaudeModel, isOpenAIModel, toOpenRouterModel };
+export { MODEL_MAP, MODELS, isClaudeModel, isOpenAIModel, isImageModel, toOpenRouterModel };

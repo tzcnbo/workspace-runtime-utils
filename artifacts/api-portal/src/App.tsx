@@ -82,11 +82,13 @@ export default function App() {
   const endpoints = [
     { method: "GET", path: "/v1/models", kind: "Both", tone: "gray" as const, desc: "Local model list in OpenAI models format." },
     { method: "POST", path: "/v1/chat/completions", kind: "OpenAI", tone: "blue" as const, desc: "OpenAI-compatible request/response format." },
+    { method: "POST", path: "/v1/images/generations", kind: "OpenAI Images", tone: "blue" as const, desc: "OpenAI-compatible image generation; internally converted to OpenRouter Chat Completions." },
     { method: "POST", path: "/v1/messages", kind: "Anthropic", tone: "orange" as const, desc: "Anthropic Messages-compatible external API; internally converted to OpenRouter Chat Completions." },
   ];
 
   const models = [
     { id: "gpt-5.5", provider: "OpenAI" },
+    { id: "openai/gpt-5.4-image-2", provider: "OpenAI Images", tags: ["Image generation", "size/quality/background/output_format"] },
     { id: "claude-opus-4-7", provider: "Anthropic", tags: ["Adaptive Thinking", "Prompt Caching", "OpenRouter upstream"] },
     { id: "claude-opus-4-6", provider: "Anthropic" },
     { id: "claude-sonnet-4-6", provider: "Anthropic" },
