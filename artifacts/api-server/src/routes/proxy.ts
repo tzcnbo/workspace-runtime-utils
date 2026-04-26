@@ -60,6 +60,31 @@ function hasOwn(obj: any, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(obj ?? {}, key);
 }
 
+function countCacheControls(value: any): number {
+  if (Array.isArray(value)) return value.reduce((total, item) => total + countCacheControls(item), 0);
+  if (!isObject(value)) return 0;
+  let total = hasOwn(value, "cache_control") ? 1 : 0;
+  for (const child of Object.values(value)) total += countCacheControls(child);
+  return total;
+}
+
+function pruneCacheControlsToLast(value: any, maxCount: number): void {
+  const owners: JsonObject[] = [];
+  const visit = (node: any) => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (!isObject(node)) return;
+    if (hasOwn(node, "cache_control")) owners.push(node);
+    for (const child of Object.values(node)) visit(child);
+  };
+
+  visit(value);
+  const removeCount = Math.max(0, owners.length - maxCount);
+  for (let i = 0; i < removeCount; i += 1) delete owners[i].cache_control;
+}
+
 function validSignature(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -222,11 +247,22 @@ function mergeProviderForClaude(payload: JsonObject): void {
   payload.provider = { order: ["anthropic"], require_parameters: true };
 }
 
-function applyClaudePromptCaching(payload: JsonObject, req: Request): void {
+function applyClaudePromptCaching(payload: JsonObject, req: Request, clientCacheControlCount: number): void {
   const promptCacheHeader = req.header("x-prompt-cache")?.trim().toLowerCase();
   const promptCacheOff = promptCacheHeader === "off" || payload.cache_control === false;
 
   if (promptCacheOff) {
+    delete payload.cache_control;
+    pruneCacheControlsToLast(payload, 4);
+    return;
+  }
+
+  if (clientCacheControlCount > 0) {
+    // Claude Desktop and similar clients already place cache_control on the
+    // exact Anthropic blocks they want cached. Do not add the OpenRouter
+    // top-level switch or append another tool marker, otherwise OpenRouter can
+    // inject one extra ephemeral block and push the request over Anthropic's
+    // hard limit of four cache_control markers.
     delete payload.cache_control;
   } else if (!hasOwn(payload, "cache_control")) {
     const ttl = req.header("x-prompt-cache-ttl")?.trim().toLowerCase();
@@ -235,11 +271,13 @@ function applyClaudePromptCaching(payload: JsonObject, req: Request): void {
 
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
     const hasToolCacheControl = payload.tools.some((tool: any) => isObject(tool) && hasOwn(tool, "cache_control"));
-    if (!hasToolCacheControl && !promptCacheOff) {
+    if (clientCacheControlCount === 0 && !hasToolCacheControl) {
       const lastIndex = payload.tools.length - 1;
       payload.tools[lastIndex] = { ...payload.tools[lastIndex], cache_control: { type: "ephemeral" } };
     }
   }
+
+  pruneCacheControlsToLast(payload, 4);
 }
 
 function mapReasoningEffortToVerbosity(effort: unknown): string | undefined {
@@ -300,14 +338,14 @@ function adaptGenericClaudeThinking(payload: JsonObject): void {
   delete payload.thinking;
 }
 
-function adaptClaudePayload(payload: JsonObject, req: Request, externalModel: string): void {
+function adaptClaudePayload(payload: JsonObject, req: Request, externalModel: string, clientCacheControlCount: number): void {
   const explicitReasoningDisabledBeforeAdapt =
     payload.include_reasoning === false ||
     (isObject(payload.reasoning) && payload.reasoning.enabled === false) ||
     (isObject(payload.thinking) && payload.thinking.type === "disabled");
 
   mergeProviderForClaude(payload);
-  applyClaudePromptCaching(payload, req);
+  applyClaudePromptCaching(payload, req, clientCacheControlCount);
   if (externalModel === "claude-opus-4-7") adaptClaudeOpus47Thinking(payload);
   else adaptGenericClaudeThinking(payload);
 
@@ -338,7 +376,7 @@ function prepareOpenAIChatPayload(body: any, req: Request): { payload: JsonObjec
 
   const payload = clone(body) as JsonObject;
   payload.model = toOpenRouterModel(externalModel);
-  if (isClaudeModel(externalModel)) adaptClaudePayload(payload, req, externalModel);
+  if (isClaudeModel(externalModel)) adaptClaudePayload(payload, req, externalModel, countCacheControls(body));
   return { payload, externalModel };
 }
 
@@ -508,7 +546,7 @@ function prepareAnthropicMessagesPayload(body: any, req: Request): { payload: Js
   if (tools) payload.tools = tools;
   const toolChoice = convertAnthropicToolChoice(body.tool_choice);
   if (toolChoice !== undefined) payload.tool_choice = toolChoice;
-  if (isClaudeModel(externalModel)) adaptClaudePayload(payload, req, externalModel);
+  if (isClaudeModel(externalModel)) adaptClaudePayload(payload, req, externalModel, countCacheControls(body));
   return { payload, externalModel };
 }
 
