@@ -537,14 +537,39 @@ function mapFinishReason(reason: string | null | undefined): string | null {
   }
 }
 
+function tokenNumber(value: any): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function mapUsageToAnthropic(usage: any): JsonObject {
-  const promptDetails = usage?.prompt_tokens_details || {};
+  const promptDetails = isObject(usage?.prompt_tokens_details) ? usage.prompt_tokens_details : {};
+  const promptTokens = tokenNumber(usage?.prompt_tokens);
+  const upstreamInputTokens = tokenNumber(usage?.input_tokens);
+  const outputTokens = tokenNumber(usage?.completion_tokens) ?? tokenNumber(usage?.output_tokens) ?? 0;
+  const cacheRead = tokenNumber(usage?.cache_read_input_tokens) ?? tokenNumber(promptDetails.cached_tokens);
+  const cacheCreation =
+    tokenNumber(usage?.cache_creation_input_tokens) ??
+    tokenNumber(promptDetails.cache_write_tokens) ??
+    tokenNumber(usage?.cache_creation?.input_tokens);
+
+  // Anthropic Messages usage.input_tokens means only the non-cached input.
+  // OpenRouter Chat Completions prompt_tokens is the total prompt tokens, so
+  // subtract cache read/write before exposing /v1/messages usage to clients
+  // such as New API. Keep /v1/chat/completions OpenAI usage unchanged.
+  const cachedInputTokens = (cacheRead ?? 0) + (cacheCreation ?? 0);
+  const inputTokens = promptTokens !== undefined
+    ? Math.max(0, promptTokens - cachedInputTokens)
+    : upstreamInputTokens ?? 0;
+
   const mapped: JsonObject = {
-    input_tokens: usage?.prompt_tokens ?? usage?.input_tokens ?? 0,
-    output_tokens: usage?.completion_tokens ?? usage?.output_tokens ?? 0,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
   };
-  const cacheRead = usage?.cache_read_input_tokens ?? promptDetails.cached_tokens;
-  const cacheCreation = usage?.cache_creation_input_tokens ?? promptDetails.cache_write_tokens ?? usage?.cache_creation?.input_tokens;
   if (cacheRead !== undefined) mapped.cache_read_input_tokens = cacheRead;
   if (cacheCreation !== undefined) mapped.cache_creation_input_tokens = cacheCreation;
   return mapped;
