@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, openSync, closeSync, rmSync, statSync } from "node:fs";
+import fs from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,7 +10,7 @@ const lockTimeoutMs = 120_000;
 const staleLockMs = 300_000;
 
 function depsPresent() {
-  return existsSync(pnpmStoreMarker) && existsSync(resolve(root, "node_modules", ".bin", "tsc"));
+  return fs.existsSync(pnpmStoreMarker) && fs.existsSync(resolve(root, "node_modules", ".bin", "tsc"));
 }
 
 function sleep(ms) {
@@ -21,13 +21,13 @@ async function acquireLock() {
   const deadline = Date.now() + lockTimeoutMs;
   while (Date.now() < deadline) {
     try {
-      const fd = openSync(lockPath, "wx");
-      closeSync(fd);
+      const fd = fs.openSync(lockPath, "wx");
+      fs.closeSync(fd);
       return true;
     } catch {
       try {
-        const age = Date.now() - statSync(lockPath).mtimeMs;
-        if (age > staleLockMs) rmSync(lockPath, { force: true });
+        const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+        if (age > staleLockMs) fs.rmSync(lockPath, { force: true });
       } catch {
         // Ignore races while another workflow is creating/removing the lock.
       }
@@ -52,6 +52,6 @@ if (!depsPresent()) {
       if (result.status !== 0) process.exit(result.status || 1);
     }
   } finally {
-    if (ownsLock) rmSync(lockPath, { force: true });
+    if (ownsLock) fs.rmSync(lockPath, { force: true });
   }
 }

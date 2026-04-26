@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, statSync } from "node:fs";
+import fs from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { dirname } from "node:path";
@@ -34,10 +34,10 @@ const server = createServer((req, res) => {
   if (url.pathname.startsWith("/api") || url.pathname.startsWith("/v1")) return void proxy(req, res);
   const requested = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
   const file = resolve(publicDir, requested);
-  const safe = file.startsWith(publicDir) && existsSync(file) && statSync(file).isFile();
+  const safe = file.startsWith(publicDir) && fs.existsSync(file) && fs.statSync(file).isFile();
   const finalFile = safe ? file : join(publicDir, "index.html");
   res.writeHead(200, { "content-type": mime[extname(finalFile)] || "application/octet-stream" });
-  createReadStream(finalFile).pipe(res);
+  fs.createReadStream(finalFile).pipe(res);
 });
 
 server.listen(port, host, () => console.log(`Static API Portal listening on http://${host}:${port}`));
