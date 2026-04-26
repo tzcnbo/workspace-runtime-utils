@@ -17,3 +17,7 @@ bash ./start-replit.sh
 ```
 
 Default port: `8080`.
+
+```bash
+fuser -k 8080/tcp
+```
