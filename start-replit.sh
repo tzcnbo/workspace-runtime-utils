@@ -47,6 +47,25 @@ ensure_node_and_pnpm() {
 
 ensure_node_and_pnpm
 
+free_port() {
+  local port_to_free="$1"
+  echo "==> Checking port ${port_to_free}"
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${port_to_free}/tcp" >/dev/null 2>&1 || true
+    sleep 1
+  elif command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids="$(lsof -ti tcp:"${port_to_free}" 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+      echo "$pids" | xargs -r kill -TERM >/dev/null 2>&1 || true
+      sleep 1
+      echo "$pids" | xargs -r kill -KILL >/dev/null 2>&1 || true
+    fi
+  else
+    echo "==> No fuser/lsof available; skipping port cleanup"
+  fi
+}
+
 echo "==> Node: $(node -v)"
 echo "==> pnpm: $(pnpm -v)"
 
@@ -57,6 +76,7 @@ echo "==> Building self-contained deploy bundle"
 pnpm build
 
 echo "==> Starting API Server on PORT=${PORT:-8080}"
+free_port "${PORT:-8080}"
 echo "==> API key: tzcnb"
 echo "==> Endpoints: /v1/models, /v1/chat/completions, /v1/messages"
 PORT="${PORT:-8080}" node artifacts/api-server/.deploy/dist/index.js
