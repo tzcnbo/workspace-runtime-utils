@@ -60,6 +60,10 @@ function hasOwn(obj: any, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(obj ?? {}, key);
 }
 
+function validSignature(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function isClaudeModel(model: string): boolean {
   return model.startsWith("claude-");
 }
@@ -388,11 +392,15 @@ function anthropicToolUseToOpenAI(block: JsonObject): JsonObject {
 function anthropicThinkingToReasoningDetail(block: JsonObject, index: number): JsonObject | undefined {
   if (block.type === "thinking") {
     const text = typeof block.thinking === "string" ? block.thinking : typeof block.text === "string" ? block.text : "";
-    if (!text) return undefined;
+    const signature = validSignature(block.signature);
+    // Claude extended-thinking blocks are signed. If a client sends back an
+    // unsigned thinking block, do not forward it as signature:null; Anthropic
+    // providers reject that transcript on the next turn.
+    if (!text || !signature) return undefined;
     return {
       type: "reasoning.text",
       text,
-      signature: block.signature ?? null,
+      signature,
       format: "anthropic-claude-v1",
       index,
     };
@@ -570,12 +578,16 @@ function reasoningDetailToAnthropicBlock(detail: any): JsonObject | undefined {
   }
 
   const thinking = reasoningDetailText(detail);
-  if (!thinking) return undefined;
+  const signature = validSignature(detail.signature);
+  // Do not emit unsigned Claude thinking blocks in Anthropic Messages format.
+  // Clients commonly replay previous assistant content verbatim; an unsigned
+  // thinking block will poison the second turn with a 400 from Anthropic.
+  if (!thinking || !signature) return undefined;
 
   return {
     type: "thinking",
     thinking,
-    ...(detail.signature !== undefined ? { signature: detail.signature } : {}),
+    signature,
   };
 }
 
@@ -757,6 +769,41 @@ function extractReasoningDeltas(choice: any): string[] {
   return out;
 }
 
+function reasoningDetailSignature(detail: any): string | undefined {
+  if (!isObject(detail)) return undefined;
+  return (
+    validSignature(detail.signature) ||
+    validSignature(detail.signature_delta) ||
+    validSignature(detail.delta?.signature) ||
+    validSignature(detail.delta?.signature_delta)
+  );
+}
+
+function extractReasoningSignatures(choice: any): string[] {
+  const delta = choice?.delta || {};
+  const out: string[] = [];
+  const direct = [
+    delta.signature,
+    delta.signature_delta,
+    delta.thinking_signature,
+    delta.reasoning_signature,
+    delta.reasoning_signature_delta,
+  ];
+  for (const value of direct) {
+    const signature = validSignature(value);
+    if (signature) out.push(signature);
+  }
+
+  if (Array.isArray(delta.reasoning_details)) {
+    for (const detail of delta.reasoning_details) {
+      const signature = reasoningDetailSignature(detail);
+      if (signature) out.push(signature);
+    }
+  }
+
+  return out;
+}
+
 async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: ExpressResponse, externalModel: string): Promise<void> {
   const abort = new AbortController();
   let clientClosed = false;
@@ -789,6 +836,8 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   let nextContentBlockIndex = 0;
   let reasoningBlockIndex: number | undefined;
   let reasoningStopped = false;
+  let reasoningSignature: string | undefined;
+  let reasoningSignatureSent = false;
   let textBlockIndex: number | undefined;
   let textStopped = false;
   let finishReason: string | null = null;
@@ -808,6 +857,14 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
 
   const stopReasoningBlock = () => {
     if (reasoningBlockIndex !== undefined && !reasoningStopped) {
+      if (reasoningSignature && !reasoningSignatureSent) {
+        reasoningSignatureSent = true;
+        writeAnthropicSSE(res, "content_block_delta", {
+          type: "content_block_delta",
+          index: reasoningBlockIndex,
+          delta: { type: "signature_delta", signature: reasoningSignature },
+        });
+      }
       reasoningStopped = true;
       writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: reasoningBlockIndex });
     }
@@ -852,6 +909,9 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
             index,
             delta: { type: "thinking_delta", thinking },
           });
+        }
+        for (const signature of extractReasoningSignatures(choice)) {
+          reasoningSignature = signature;
         }
 
         const text = extractTextDelta(choice);
