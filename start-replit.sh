@@ -62,5 +62,5 @@ pnpm --filter @workspace/api-server run build
 echo "==> Starting API Server on PORT=${PORT:-8080}"
 echo "==> API key: tzcnb"
 echo "==> Endpoints: /v1/models, /v1/chat/completions, /v1/messages"
-PORT="${PORT:-8080}" node artifacts/api-server/dist/index.js
+PORT="${PORT:-8080}" node scripts/start-production.mjs
 
