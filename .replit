@@ -9,8 +9,8 @@ id = "artifacts/api-portal"
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
-build = ["sh", "-c", "pnpm --filter @workspace/api-portal run build && pnpm --filter @workspace/api-server run build"]
-run = ["sh", "-c", "node scripts/start-production.mjs"]
+build = ["sh", "-c", "pnpm build"]
+run = ["sh", "-c", "node artifacts/api-server/.deploy/dist/index.js"]
 
 [workflows]
 runButton = "Project"

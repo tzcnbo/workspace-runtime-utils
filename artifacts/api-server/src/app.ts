@@ -36,6 +36,7 @@ app.use("/v1", proxyRouter);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const portalDistCandidates = [
+  path.resolve(__dirname, "../public"),
   path.resolve(process.cwd(), "../api-portal/dist/public"),
   path.resolve(process.cwd(), "../api-portal/dist"),
   path.resolve(__dirname, "../../api-portal/dist/public"),

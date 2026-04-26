@@ -53,14 +53,11 @@ echo "==> pnpm: $(pnpm -v)"
 echo "==> Installing dependencies"
 CI=true pnpm install --no-frozen-lockfile
 
-echo "==> Writing static API Portal"
-node scripts/write-static-portal.mjs
-
-echo "==> Building API Server (tsc, no esbuild/vite)"
-pnpm --filter @workspace/api-server run build
+echo "==> Building self-contained deploy bundle"
+pnpm build
 
 echo "==> Starting API Server on PORT=${PORT:-8080}"
 echo "==> API key: tzcnb"
 echo "==> Endpoints: /v1/models, /v1/chat/completions, /v1/messages"
-PORT="${PORT:-8080}" node scripts/start-production.mjs
+PORT="${PORT:-8080}" node artifacts/api-server/.deploy/dist/index.js
 
