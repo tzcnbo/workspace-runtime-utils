@@ -10,7 +10,7 @@ const lockTimeoutMs = 120_000;
 const staleLockMs = 300_000;
 
 function depsPresent() {
-  return existsSync(pnpmStoreMarker);
+  return existsSync(pnpmStoreMarker) && (existsSync(resolve(root, "node_modules", ".bin", "vite")) || existsSync(resolve(root, "node_modules", ".bin", "tsx")));
 }
 
 function sleep(ms) {
@@ -47,6 +47,7 @@ if (!depsPresent()) {
         cwd: root,
         stdio: "inherit",
         shell: process.platform === "win32",
+        env: { ...process.env, CI: "true" },
       });
       if (result.status !== 0) process.exit(result.status || 1);
     }

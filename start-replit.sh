@@ -51,7 +51,7 @@ echo "==> Node: $(node -v)"
 echo "==> pnpm: $(pnpm -v)"
 
 echo "==> Installing dependencies"
-pnpm install --no-frozen-lockfile
+CI=true pnpm install --no-frozen-lockfile
 
 echo "==> Building API Portal"
 PORT=24927 BASE_PATH=/ pnpm --filter @workspace/api-portal run build
