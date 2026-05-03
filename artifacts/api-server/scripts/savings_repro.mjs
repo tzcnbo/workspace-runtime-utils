@@ -146,11 +146,8 @@ async function runTextScenario() {
   if (result.business.length < 3000) {
     failures.push(`business content < 3000 chars (got ${result.business.length})`);
   }
-  if (result.business.includes("<<<HANDOFF_TOKEN_BEGIN")) {
-    failures.push("business content leaked sentinel begin marker to client");
-  }
-  if (result.business.includes("HANDOFF_TOKEN_END_DO_NOT_MODIFY")) {
-    failures.push("business content leaked sentinel end marker to client");
+  if (result.business.includes("pipeline_nonce_token_v1_")) {
+    failures.push("business content leaked nonce prefix to client");
   }
   if (result.abortedFromComment !== true) {
     failures.push(`expected aborted=1 (sentinel hit), got ${result.abortedFromComment}`);
@@ -246,14 +243,11 @@ async function runToolScenario() {
     failures.push(`expected x-savings-mode=applied, got ${JSON.stringify(result.headerSavingsMode)}`);
   }
   for (const tc of result.toolCalls) {
-    if (tc.name === "__end_marker") {
-      failures.push("client received __end_marker tool call (must be filtered out)");
+    if (tc.arguments.includes("pipeline_nonce_token_v1_")) {
+      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked nonce prefix`);
     }
-    if (tc.arguments.includes("<<<HANDOFF_TOKEN_BEGIN")) {
-      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked sentinel begin marker`);
-    }
-    if (tc.arguments.includes("HANDOFF_TOKEN_END_DO_NOT_MODIFY")) {
-      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked sentinel end marker`);
+    if (tc.arguments.includes("_handoff_token")) {
+      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked _handoff_token key`);
     }
   }
   const analyze = result.toolCalls.find((t) => t.name === "analyze_postgres_query");
