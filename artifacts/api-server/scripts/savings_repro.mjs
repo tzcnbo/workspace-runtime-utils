@@ -146,8 +146,8 @@ async function runTextScenario() {
   if (result.business.length < 3000) {
     failures.push(`business content < 3000 chars (got ${result.business.length})`);
   }
-  if (result.business.includes("pipeline_nonce_token_v1_")) {
-    failures.push("business content leaked nonce prefix to client");
+  if (result.business.includes("<<<REPLIT_PROXY_RESPONSE_META_BEGIN>>>")) {
+    failures.push("business content leaked meta block begin marker to client");
   }
   if (result.abortedFromComment !== true) {
     failures.push(`expected aborted=1 (sentinel hit), got ${result.abortedFromComment}`);
@@ -243,8 +243,8 @@ async function runToolScenario() {
     failures.push(`expected x-savings-mode=applied, got ${JSON.stringify(result.headerSavingsMode)}`);
   }
   for (const tc of result.toolCalls) {
-    if (tc.arguments.includes("pipeline_nonce_token_v1_")) {
-      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked nonce prefix`);
+    if (tc.arguments.includes("<<<REPLIT_PROXY_RESPONSE_META_BEGIN>>>")) {
+      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked meta block begin marker`);
     }
     if (tc.arguments.includes("_handoff_token")) {
       failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked _handoff_token key`);
