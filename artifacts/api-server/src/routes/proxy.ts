@@ -1663,6 +1663,331 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   }
 }
 
+// Anthropic Messages 流式 + savings:在 OpenRouter 上游 chunk 层面同时做
+//   1) 文本滑动窗口检测 sentinel,命中即裁掉 sentinel 之后的输出并 abort 上游;
+//   2) tool_calls 按 index 维护累积 name/args,过滤 __end_marker 不让它产生
+//      content_block_start / input_json_delta / content_block_stop 三件套;
+// 经过过滤后再翻译成 Anthropic SSE,避免 marker 工具进入客户端可见的 content blocks。
+async function pipeWithSavingsAsAnthropic(
+  payload: JsonObject,
+  req: Request,
+  res: ExpressResponse,
+  externalModel: string,
+  branch: "text" | "tool",
+): Promise<void> {
+  const startedAt = Date.now();
+  const upstreamCtrl = new AbortController();
+  let clientClosed = false;
+  let upstreamAborted = false;
+
+  const closeUpstream = (reason: string) => {
+    if (upstreamAborted) return;
+    upstreamAborted = true;
+    logSavings(branch, "upstream_abort_anthropic", { reason, ms_since_start: Date.now() - startedAt });
+    upstreamCtrl.abort();
+  };
+  const markClientClosed = () => {
+    if (clientClosed) return;
+    clientClosed = true;
+    closeUpstream("client_close");
+  };
+  req.on("aborted", markClientClosed);
+  res.on("close", () => { if (!res.writableEnded) markClientClosed(); });
+
+  const upstream = await callOpenRouterChatCompletions(payload, { signal: upstreamCtrl.signal });
+  if (!upstream.ok) {
+    const body = await readResponseBody(upstream);
+    sendAnthropicError(res, upstream.status, errorMessageFromBody(body, "OpenRouter upstream error"));
+    return;
+  }
+  if (!upstream.body) { sendAnthropicError(res, 502, "OpenRouter stream response body is empty"); return; }
+
+  const messageId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader(SAVINGS_HEADER, "applied");
+  res.flushHeaders?.();
+
+  const keepAlive = setInterval(() => {
+    if (!clientClosed && !res.writableEnded) writeAnthropicSSE(res, "ping", { type: "ping" });
+  }, 5000);
+
+  let nextContentBlockIndex = 0;
+  let reasoningBlockIndex: number | undefined;
+  let reasoningStopped = false;
+  let reasoningSignature: string | undefined;
+  let reasoningSignatureSent = false;
+  let textBlockIndex: number | undefined;
+  let textStopped = false;
+  let textForwardedLen = 0;
+  let textBuf = "";
+  let finishReason: string | null = null;
+  let latestUsage: any = null;
+
+  type ToolStateAnthropic = {
+    blockIndex?: number;
+    isMarker: boolean;
+    started: boolean;
+    stopped: boolean;
+    nameBuf: string;
+    argsBuf: string;
+    id: string;
+    name: string;
+  };
+  const toolStates = new Map<string, ToolStateAnthropic>();
+
+  const startReasoningBlock = () => {
+    if (reasoningBlockIndex !== undefined) return reasoningBlockIndex;
+    reasoningBlockIndex = nextContentBlockIndex++;
+    writeAnthropicSSE(res, "content_block_start", {
+      type: "content_block_start",
+      index: reasoningBlockIndex,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    return reasoningBlockIndex;
+  };
+  const stopReasoningBlock = () => {
+    if (reasoningBlockIndex !== undefined && !reasoningStopped) {
+      if (reasoningSignature && !reasoningSignatureSent) {
+        reasoningSignatureSent = true;
+        writeAnthropicSSE(res, "content_block_delta", {
+          type: "content_block_delta",
+          index: reasoningBlockIndex,
+          delta: { type: "signature_delta", signature: reasoningSignature },
+        });
+      }
+      reasoningStopped = true;
+      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: reasoningBlockIndex });
+    }
+  };
+  const startTextBlock = () => {
+    stopReasoningBlock();
+    if (textBlockIndex !== undefined) return textBlockIndex;
+    textBlockIndex = nextContentBlockIndex++;
+    writeAnthropicSSE(res, "content_block_start", {
+      type: "content_block_start",
+      index: textBlockIndex,
+      content_block: { type: "text", text: "" },
+    });
+    return textBlockIndex;
+  };
+
+  // 把 textBuf 中的内容刷出去,直到累计已 forwarded 的 text 长度等于 target。
+  // target 单位是 text 总字符数(textForwardedLen + textBuf 中已发送部分)。
+  const flushTextTo = (target: number): void => {
+    if (target <= textForwardedLen || textBuf.length === 0) return;
+    const take = Math.min(textBuf.length, target - textForwardedLen);
+    if (take <= 0) return;
+    const slice = textBuf.slice(0, take);
+    const index = startTextBlock();
+    writeAnthropicSSE(res, "content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text: slice },
+    });
+    textForwardedLen += slice.length;
+    textBuf = textBuf.slice(slice.length);
+  };
+
+  try {
+    writeAnthropicSSE(res, "message_start", {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model: externalModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+
+    let argsSentinelHit = false;
+    outer: for await (const chunk of parseOpenAISSE(upstream.body)) {
+      if (clientClosed || upstreamAborted) break;
+      if (chunk.usage) latestUsage = chunk.usage;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      for (const choice of choices) {
+        for (const thinking of extractReasoningDeltas(choice)) {
+          const index = startReasoningBlock();
+          writeAnthropicSSE(res, "content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: { type: "thinking_delta", thinking },
+          });
+        }
+        for (const signature of extractReasoningSignatures(choice)) {
+          reasoningSignature = signature;
+        }
+
+        const text = extractTextDelta(choice);
+        if (text) {
+          textBuf += text;
+          const sentinelIdx = textBuf.indexOf(SAVINGS_SENTINEL_BEGIN);
+          if (sentinelIdx !== -1) {
+            // 命中 sentinel:把跨界 chunk 切成"sentinel 之前"那一段,然后立即关掉
+            // text block 并 abort 上游,丢弃 sentinel 及之后的所有内容。
+            flushTextTo(textForwardedLen + sentinelIdx);
+            if (textBlockIndex !== undefined && !textStopped) {
+              textStopped = true;
+              writeAnthropicSSE(res, "content_block_stop", {
+                type: "content_block_stop",
+                index: textBlockIndex,
+              });
+            }
+            logSavings(branch, "anthropic_text_sentinel_hit", {
+              ms_since_start: Date.now() - startedAt,
+              forwarded_text_chars: textForwardedLen,
+            });
+            closeUpstream("text_sentinel_hit");
+            break outer;
+          }
+          // 安全水位:textBuf 末尾保留 SENTINEL.length 字符不刷出,避免漏发
+          // sentinel 的前缀。
+          const safeFlushLen = textBuf.length - SAVINGS_SENTINEL_BEGIN.length;
+          if (safeFlushLen > 0) flushTextTo(textForwardedLen + safeFlushLen);
+        }
+
+        const toolCalls = choice?.delta?.tool_calls || choice?.message?.tool_calls;
+        if (Array.isArray(toolCalls)) {
+          for (let i = 0; i < toolCalls.length; i += 1) {
+            const tc = toolCalls[i];
+            const key = String(tc.index ?? tc.id ?? i);
+            let state = toolStates.get(key);
+            if (!state) {
+              state = {
+                blockIndex: undefined,
+                isMarker: false,
+                started: false,
+                stopped: false,
+                nameBuf: "",
+                argsBuf: "",
+                id: tc.id || `call_${crypto.randomUUID().replace(/-/g, "")}`,
+                name: "",
+              };
+              toolStates.set(key, state);
+            } else if (tc.id && state.id.startsWith("call_") && state.id !== tc.id) {
+              // 上游有时第二个 chunk 才下发 id;已 emit content_block_start 之前
+              // 都允许覆盖,emit 之后不再回写避免与已发的 block 不一致。
+              if (!state.started) state.id = tc.id;
+            }
+
+            const namePart = tc.function?.name;
+            if (typeof namePart === "string" && namePart.length > 0) {
+              state.nameBuf += namePart;
+              state.name = state.nameBuf;
+              if (
+                state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
+                (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
+                  state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME))
+              ) {
+                state.isMarker = true;
+              }
+            }
+
+            const argsPart = tc.function?.arguments;
+            if (typeof argsPart === "string" && argsPart.length > 0) {
+              state.argsBuf += argsPart;
+              if (state.argsBuf.includes(SAVINGS_SENTINEL_BEGIN)) {
+                state.isMarker = true;
+                argsSentinelHit = true;
+              }
+            }
+
+            if (state.isMarker) continue;
+
+            if (!state.started) {
+              state.blockIndex = nextContentBlockIndex++;
+              state.started = true;
+              writeAnthropicSSE(res, "content_block_start", {
+                type: "content_block_start",
+                index: state.blockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: state.id,
+                  name: state.name || "tool",
+                  input: {},
+                },
+              });
+            }
+            if (
+              typeof argsPart === "string" &&
+              argsPart.length > 0 &&
+              state.blockIndex !== undefined
+            ) {
+              writeAnthropicSSE(res, "content_block_delta", {
+                type: "content_block_delta",
+                index: state.blockIndex,
+                delta: { type: "input_json_delta", partial_json: argsPart },
+              });
+            }
+          }
+        }
+
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+      }
+
+      if (argsSentinelHit) {
+        logSavings(branch, "anthropic_tool_args_sentinel_hit", {
+          ms_since_start: Date.now() - startedAt,
+        });
+        closeUpstream("tool_args_sentinel_hit");
+        break;
+      }
+    }
+
+    if (clientClosed) return;
+
+    // 上游自然收尾且未触发 sentinel:把残留的 text buffer 全部刷出
+    if (!upstreamAborted && textBuf.length > 0) {
+      flushTextTo(textForwardedLen + textBuf.length);
+    }
+
+    stopReasoningBlock();
+    if (textBlockIndex !== undefined && !textStopped) {
+      textStopped = true;
+      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+    }
+    for (const [, state] of toolStates) {
+      if (state.started && !state.stopped && state.blockIndex !== undefined) {
+        state.stopped = true;
+        writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: state.blockIndex });
+      }
+    }
+
+    const usage = mapUsageToAnthropic(latestUsage);
+    // abort 触发的收尾:tool 分支的 stop_reason 取 "tool_use",text 分支用 "end_turn"。
+    // 自然收尾仍然走 mapFinishReason。
+    const stopReason = upstreamAborted
+      ? (branch === "tool" ? "tool_use" : "end_turn")
+      : (mapFinishReason(finishReason) || "end_turn");
+    writeAnthropicSSE(res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: {
+        output_tokens: usage.output_tokens ?? 0,
+        ...(usage.input_tokens !== undefined ? { input_tokens: usage.input_tokens } : {}),
+        ...(usage.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+        ...(usage.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}),
+      },
+    });
+    writeAnthropicSSE(res, "message_stop", { type: "message_stop" });
+    res.end();
+  } catch (error: any) {
+    if (!clientClosed) {
+      writeAnthropicSSE(res, "error", { type: "error", error: { type: "api_error", message: error?.message || "Stream conversion failed" } });
+      res.end();
+    }
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
 router.use(requireAuth);
 
 router.get("/models", (_req, res) => {
@@ -1689,22 +2014,19 @@ router.post("/chat/completions", async (req, res) => {
   try {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
 
-    // Streaming savings opt-in:仅当 header 显式打开且条件全部满足才接管,
-    // 任意一条不满足都透传到既有路径,绝不悄悄改写非 opt-in 请求。
-    if (req.header(SAVINGS_HEADER) === "1") {
-      const branch = chooseSavingsBranch(payload, externalModel);
-      if (branch === "text") {
-        injectSavingsTextHandoff(payload);
-        await pipeWithSavings(payload, req, res, "text");
-        return;
-      }
-      if (branch === "tool") {
-        injectSavingsToolHandoff(payload);
-        await pipeWithSavings(payload, req, res, "tool");
-        return;
-      }
-      // ineligible(非 stream / 非 Claude / image 模型等)一律标记 skipped 后透传
-      res.setHeader(SAVINGS_HEADER, "skipped");
+    // Streaming savings:对所有合格请求(stream + Claude 模型)默认强制接管,
+    // 不依赖任何 header / query 开关,因为客户端通常无法转发自定义请求头。
+    // 不合格(非 stream、image 模型、非 Claude)按原路径透传。
+    const branch = chooseSavingsBranch(payload, externalModel);
+    if (branch === "text") {
+      injectSavingsTextHandoff(payload);
+      await pipeWithSavings(payload, req, res, "text");
+      return;
+    }
+    if (branch === "tool") {
+      injectSavingsToolHandoff(payload);
+      await pipeWithSavings(payload, req, res, "tool");
+      return;
     }
 
     if (payload.stream === true) {
@@ -1729,6 +2051,19 @@ router.post("/messages", async (req, res) => {
   try {
     const { payload, externalModel } = prepareAnthropicMessagesPayload(req.body, req);
     if (payload.stream === true) {
+      // /v1/messages 是 Claude Desktop / Claude Code / Cherry Studio 等客户端
+      // 默认使用的端点,因此 savings 必须在这条路径同样默认接管。
+      const branch = chooseSavingsBranch(payload, externalModel);
+      if (branch === "text") {
+        injectSavingsTextHandoff(payload);
+        await pipeWithSavingsAsAnthropic(payload, req, res, externalModel, "text");
+        return;
+      }
+      if (branch === "tool") {
+        injectSavingsToolHandoff(payload);
+        await pipeWithSavingsAsAnthropic(payload, req, res, externalModel, "tool");
+        return;
+      }
       await streamOpenAIAsAnthropic(payload, req, res, externalModel);
       return;
     }
