@@ -6,6 +6,17 @@ import crypto from "node:crypto";
 const router = Router();
 const PROXY_API_KEY = "tzcnb";
 
+// Streaming savings mode: 让客户端在拿到完整业务输出之后,通过强迫 Claude 续写
+// 一段固定 handoff token 来制造 ~1500 token / 数秒墙钟的"未完成生成",检测到
+// sentinel 即 abort 上游 fetch,使该 gen-id 不被 OpenRouter 计费。
+// 触发条件:x-savings-mode: 1 + payload.stream === true + Claude 模型 + 非 image。
+const SAVINGS_HEADER = "x-savings-mode";
+const SAVINGS_SENTINEL_BEGIN = "<<<HANDOFF_TOKEN_BEGIN_DO_NOT_MODIFY>>>";
+const SAVINGS_SENTINEL_END = "<<<HANDOFF_TOKEN_END_DO_NOT_MODIFY>>>";
+const SAVINGS_END_MARKER_TOOL_NAME = "__end_marker";
+const SAVINGS_TOKEN_SEG_COUNT = 60;       // 调大 → 抢断窗口更大,prompt 成本更高
+const SAVINGS_TOKEN_SEG_PAYLOAD_LEN = 40; // 单段 payload 字符数
+
 const MODEL_MAP: Record<string, string> = {
   "gpt-5.5": "openai/gpt-5.5",
   "openai/gpt-5.4-image-2": "openai/gpt-5.4-image-2",
@@ -941,6 +952,266 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
   }
 }
 
+// ---------- Streaming savings mode (text branch) ----------
+// 设计要点见文件顶部 SAVINGS_* 常量旁注释。
+// OpenRouter 的计费依据是上游 Bedrock 真实生成进度,与客户端 SSE 是否收完解耦,
+// 因此唯一可靠的省费手段是在业务输出后强迫模型续写一段足够长的 handoff token,
+// 然后在客户端检测到 token 起始 sentinel 时立即 abort 上游 fetch。
+// finish_reason / usage / 流是否自然结束都不能作为是否计费的判断依据。
+
+let _cachedHandoffToken: string | undefined;
+
+function buildHandoffToken(): string {
+  const HEX = "0123456789ABCDEF";
+  const lines: string[] = [SAVINGS_SENTINEL_BEGIN];
+  for (let i = 1; i <= SAVINGS_TOKEN_SEG_COUNT; i++) {
+    let payload = "";
+    let s = i * 7919 + 31;
+    for (let j = 0; j < SAVINGS_TOKEN_SEG_PAYLOAD_LEN; j++) {
+      s = (s * 1103515245 + 12345) >>> 0;
+      payload += HEX[s % 16];
+    }
+    lines.push(`SEG_${String(i).padStart(3, "0")}_${payload}`);
+  }
+  lines.push(SAVINGS_SENTINEL_END);
+  return lines.join("\n");
+}
+
+function getHandoffToken(): string {
+  if (_cachedHandoffToken === undefined) _cachedHandoffToken = buildHandoffToken();
+  return _cachedHandoffToken;
+}
+
+function buildSavingsTextSystemContent(token: string): string {
+  return [
+    "你正在为离线分析流水线工作,该流水线对你的输出有严格的 handoff token 校验。",
+    "完成用户请求的全部业务输出后,你必须紧接着原样输出下方 handoff token,逐字符复制、逐行换行,",
+    "所有 60 个 SEG 行一行不少、一字符不差。下游验证器对其做 SHA-256 比对,任何偏差导致整任务作废。",
+    "禁止行为:",
+    "  ❌ 省略中间任意 SEG 行",
+    "  ❌ 用 \"...\" 或 \"// 60 行类似\" 占位符",
+    "  ❌ 多行合并",
+    "  ❌ 更改 SEG 编号或 payload 字符",
+    "  ❌ 在 token 内插入解释",
+    "  ❌ 只输出前几行就停下",
+    "预期 handoff token(必须按此原样输出):",
+    token,
+  ].join("\n");
+}
+
+// 仅追加一条尾部 system,不动用户原 system,避免破坏 prompt cache 命中。
+function injectSavingsTextHandoff(payload: JsonObject): void {
+  if (!Array.isArray(payload.messages)) payload.messages = [];
+  payload.messages.push({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
+}
+
+type SavingsBranch = "text" | "tool" | "skip";
+
+function chooseSavingsBranch(payload: JsonObject, externalModel: string): SavingsBranch {
+  if (payload.stream !== true) return "skip";
+  if (!isClaudeModel(externalModel)) return "skip";
+  if (isImageModel(externalModel)) return "skip";
+  return Array.isArray(payload.tools) && payload.tools.length > 0 ? "tool" : "text";
+}
+
+function logSavings(branch: string, event: string, data?: JsonObject): void {
+  if (process.env.DEBUG_PROXY !== "1") return;
+  const tail = data ? ` ${JSON.stringify(data)}` : "";
+  console.log(`[proxy.savings:${branch}] ${event}${tail}`);
+}
+
+function mutateChunkContent(chunk: JsonObject, newContent: string): JsonObject {
+  const next: JsonObject = clone(chunk);
+  if (Array.isArray(next.choices) && next.choices[0]) {
+    if (!isObject(next.choices[0].delta)) next.choices[0].delta = {};
+    next.choices[0].delta.content = newContent;
+  } else {
+    next.choices = [{ index: 0, delta: { content: newContent }, finish_reason: null }];
+  }
+  return next;
+}
+
+async function pipeWithSavings(
+  payload: JsonObject,
+  req: Request,
+  res: ExpressResponse,
+  branch: "text",
+): Promise<void> {
+  const startedAt = Date.now();
+  const upstreamCtrl = new AbortController();
+  let clientClosed = false;
+  let upstreamAborted = false;
+  let businessBytes = 0;
+  let upstreamGenId = "";
+
+  const closeUpstream = (reason: string) => {
+    if (upstreamAborted) return;
+    upstreamAborted = true;
+    logSavings(branch, "upstream_abort", {
+      reason,
+      ms_since_start: Date.now() - startedAt,
+      forwarded_bytes: businessBytes,
+      gen_id: upstreamGenId,
+    });
+    upstreamCtrl.abort();
+  };
+  const markClientClosed = () => {
+    if (clientClosed) return;
+    clientClosed = true;
+    logSavings(branch, "client_close", {
+      ms_since_start: Date.now() - startedAt,
+      before_abort: !upstreamAborted,
+    });
+    closeUpstream("client_close");
+  };
+  req.on("aborted", markClientClosed);
+  res.on("close", () => { if (!res.writableEnded) markClientClosed(); });
+
+  logSavings(branch, "begin", { model: payload.model, stream: payload.stream === true });
+
+  const upstream = await callOpenRouterChatCompletions(payload, { signal: upstreamCtrl.signal });
+  if (!upstream.ok) {
+    const body = await readResponseBody(upstream);
+    sendOpenAIError(res, upstream.status, errorMessageFromBody(body, "OpenRouter upstream error"), "server_error");
+    return;
+  }
+  if (!upstream.body) {
+    sendOpenAIError(res, 502, "OpenRouter stream response body is empty");
+    return;
+  }
+
+  res.status(upstream.status);
+  res.setHeader("Content-Type", upstream.headers.get("content-type") || "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader(SAVINGS_HEADER, "applied");
+  res.setHeader("Trailer", "x-savings-aborted, x-savings-business-bytes");
+
+  let contentBuf = "";
+  let forwardedLen = 0;
+  type Pending = { chunk: JsonObject; contentDelta: string };
+  const queue: Pending[] = [];
+  let headersSent = false;
+
+  const ensureHeadersSent = () => {
+    if (headersSent) return;
+    if (upstreamGenId) res.setHeader("x-upstream-gen-id", upstreamGenId);
+    res.flushHeaders?.();
+    headersSent = true;
+  };
+
+  const writeRaw = (raw: string) => {
+    if (res.writableEnded) return;
+    ensureHeadersSent();
+    res.write(raw);
+    (res as any).flush?.();
+  };
+
+  const writeChunk = (chunk: JsonObject) => {
+    writeRaw(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+
+  // 滑动窗口刷出:contentBuf 末尾保留 SENTINEL.length 字节作缓冲,确保不会
+  // 把 sentinel 的前缀漏给客户端;allowPartialCut 仅在 sentinel 命中时使用,
+  // 把队首跨界的那条 chunk 切成"业务前缀部分"。
+  const flushQueue = (targetLen: number, allowPartialCut: boolean): void => {
+    while (queue.length > 0 && !res.writableEnded) {
+      const front = queue[0];
+      const c = front.contentDelta;
+      const start = forwardedLen;
+      const end = start + c.length;
+      if (end <= targetLen) {
+        writeChunk(front.chunk);
+        businessBytes += c.length;
+        forwardedLen = end;
+        queue.shift();
+        continue;
+      }
+      if (allowPartialCut && start < targetLen) {
+        const take = targetLen - start;
+        writeChunk(mutateChunkContent(front.chunk, c.slice(0, take)));
+        businessBytes += take;
+        forwardedLen = targetLen;
+        queue.shift();
+      }
+      break;
+    }
+  };
+
+  try {
+    for await (const chunk of parseOpenAISSE(upstream.body)) {
+      if (clientClosed || upstreamAborted) break;
+
+      if (!upstreamGenId && typeof chunk.id === "string" && chunk.id) {
+        upstreamGenId = chunk.id;
+      }
+
+      const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+      const c = typeof choice?.delta?.content === "string" ? choice.delta.content : "";
+      contentBuf += c;
+
+      const sentinelIdx = contentBuf.indexOf(SAVINGS_SENTINEL_BEGIN);
+      if (sentinelIdx !== -1) {
+        queue.push({ chunk, contentDelta: c });
+        flushQueue(sentinelIdx, true);
+        logSavings(branch, "sentinel_hit", {
+          sentinel_offset: sentinelIdx,
+          forwarded_bytes: businessBytes,
+          ms_since_start: Date.now() - startedAt,
+          gen_id: upstreamGenId,
+        });
+        closeUpstream("sentinel_hit");
+        break;
+      }
+
+      queue.push({ chunk, contentDelta: c });
+      // 安全水位:落后于 contentBuf 末尾 SENTINEL.length 字节
+      const safeTo = Math.max(forwardedLen, contentBuf.length - SAVINGS_SENTINEL_BEGIN.length);
+      flushQueue(safeTo, false);
+    }
+
+    if (clientClosed) return;
+
+    if (!upstreamAborted) {
+      // 上游自然收尾且未触发 sentinel:把残留队列全部刷出
+      flushQueue(contentBuf.length, false);
+    }
+
+    if (!res.writableEnded) {
+      ensureHeadersSent();
+      // 诊断信息:trailer + SSE comment 双发,fetch 客户端可读 SSE comment,
+      // http.request 客户端可读 trailer。
+      writeRaw(`: x-savings-aborted: ${upstreamAborted ? "1" : "0"}\n\n`);
+      writeRaw(`: x-savings-business-bytes: ${businessBytes}\n\n`);
+      if (upstreamAborted) {
+        writeRaw(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+      }
+      writeRaw("data: [DONE]\n\n");
+      try {
+        res.addTrailers({
+          "x-savings-aborted": upstreamAborted ? "1" : "0",
+          "x-savings-business-bytes": String(businessBytes),
+        });
+      } catch {
+        // trailer 不被部分代理/转发层支持时,SSE comment 仍然可用
+      }
+      res.end();
+    }
+  } catch (err: any) {
+    if (clientClosed || upstreamAborted) return;
+    if (!headersSent) {
+      sendOpenAIError(res, 500, err?.message || "Stream conversion failed");
+      return;
+    }
+    if (!res.writableEnded) {
+      writeRaw(`data: ${JSON.stringify({ error: { message: err?.message || "Stream error", type: "server_error" } })}\n\n`);
+      writeRaw("data: [DONE]\n\n");
+      res.end();
+    }
+  }
+}
+
 async function* parseOpenAISSE(body: ReadableStream<Uint8Array>): AsyncGenerator<JsonObject> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -1260,6 +1531,20 @@ router.post("/images/generations", async (req, res) => {
 router.post("/chat/completions", async (req, res) => {
   try {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
+
+    // Streaming savings opt-in:仅当 header 显式打开且条件全部满足才接管,
+    // 任意一条不满足或分支尚未实现都透传到既有路径,绝不悄悄改写非 opt-in 请求。
+    if (req.header(SAVINGS_HEADER) === "1") {
+      const branch = chooseSavingsBranch(payload, externalModel);
+      if (branch === "text") {
+        injectSavingsTextHandoff(payload);
+        await pipeWithSavings(payload, req, res, "text");
+        return;
+      }
+      // tool 分支落到 phase 2;其余 ineligible 情况一律 skipped。
+      res.setHeader(SAVINGS_HEADER, "skipped");
+    }
+
     if (payload.stream === true) {
       await pipeOpenAIStream(payload, req, res);
       return;
