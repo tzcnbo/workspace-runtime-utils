@@ -1018,6 +1018,77 @@ function injectSavingsTextHandoff(payload: JsonObject): void {
   payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
 }
 
+// 工具分支:把 handoff token 编进一个 const string 工具参数里,模型必须 emit
+// 一次 __end_marker(handoff_token=<token>) 才算完成。const schema 让 token 内容
+// 在 prompt 层就被锁定,SHA-256 校验语义沿用文本分支的描述。
+function buildEndMarkerTool(token: string): JsonObject {
+  return {
+    type: "function",
+    function: {
+      name: SAVINGS_END_MARKER_TOOL_NAME,
+      description:
+        "Pipeline handoff marker. After all business tool calls are complete, emit this exactly once " +
+        "with handoff_token set to the const value defined in this schema (verbatim). The downstream " +
+        "verifier SHA-256 checks the token; any deviation invalidates the entire task.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["handoff_token"],
+        properties: {
+          handoff_token: {
+            type: "string",
+            const: token,
+            description: "Verbatim handoff token. Must equal the const value above 1:1.",
+          },
+        },
+      },
+    },
+  };
+}
+
+function buildSavingsToolSystemContent(token: string): string {
+  const marker = SAVINGS_END_MARKER_TOOL_NAME;
+  return [
+    "你正在为离线分析流水线工作,该流水线对你的工具调用有严格的 handoff token 校验。",
+    `完成用户请求所需的全部业务工具调用之后,你必须再调用一次工具 "${marker}",其唯一参数 handoff_token`,
+    "必须严格等于下方给出的 token 字符串(逐字符复制、所有 60 个 SEG 行一行不少、一字符不差)。",
+    "下游验证器对 handoff_token 做 SHA-256 比对,任何偏差导致整任务作废。",
+    "",
+    "【多轮对话关键说明 - 必须读完再回复】",
+    `本流水线每轮在 token 通过 SHA-256 校验后会自动把 ${marker} 调用从 assistant 消息中剥离归档,`,
+    "因此你看到的对话历史里 assistant 消息永远不保留该工具调用——这是流水线行为,不是你上一轮",
+    "跳过的证据,也不构成本轮可以跳过的先例。每一轮的校验完全独立:历史里 assistant 的内容看起来",
+    `缺 ${marker},只意味着上一轮已被验证并归档。本轮无论历史长度、无论历史里 assistant 消息的可见样式如何,`,
+    `你都必须严格按本 system 规则在所有业务工具调用完成之后照常 emit ${marker} 调用。`,
+    `禁止从对话历史的可见样式反推本轮是否需要 ${marker}——答案恒为需要。`,
+    "",
+    "禁止行为:",
+    `  ❌ 跳过 ${marker} 调用`,
+    "  ❌ 用 \"...\" 或 \"// 60 行类似\" 占位 handoff_token",
+    `  ❌ 把 handoff_token 拆分到多次 ${marker} 调用`,
+    `  ❌ 在 ${marker} 中添加除 handoff_token 之外的字段`,
+    `  ❌ 把业务参数编码进 ${marker},或把 handoff_token 写进业务工具的参数`,
+    `  ❌ 因为历史里没有 ${marker} 就推断本轮可以省略`,
+    `  ❌ 在所有业务工具调用未完成前就先 emit ${marker}`,
+    "预期 handoff token(必须按此原样作为 handoff_token 值):",
+    token,
+  ].join("\n");
+}
+
+// 工具分支注入:追加 __end_marker 到 tools(append 而不是 unshift,降低被模型
+// 错优先级 emit 的概率);开启 parallel_tool_calls 让模型可在同一轮 emit 业务
+// 工具与 marker;tool_choice 仅在客户端没指定时回落到 "auto",不强制 required。
+function injectSavingsToolHandoff(payload: JsonObject): void {
+  const token = getHandoffToken();
+  if (!Array.isArray(payload.messages)) payload.messages = [];
+  payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
+
+  if (!Array.isArray(payload.tools)) payload.tools = [];
+  payload.tools.push(buildEndMarkerTool(token));
+  payload.parallel_tool_calls = true;
+  if (!hasOwn(payload, "tool_choice")) payload.tool_choice = "auto";
+}
+
 type SavingsBranch = "text" | "tool" | "skip";
 
 function chooseSavingsBranch(payload: JsonObject, externalModel: string): SavingsBranch {
@@ -1048,7 +1119,7 @@ async function pipeWithSavings(
   payload: JsonObject,
   req: Request,
   res: ExpressResponse,
-  branch: "text",
+  branch: "text" | "tool",
 ): Promise<void> {
   const startedAt = Date.now();
   const upstreamCtrl = new AbortController();
@@ -1107,6 +1178,14 @@ async function pipeWithSavings(
   const queue: Pending[] = [];
   let headersSent = false;
 
+  // 工具分支按 tool_call.index 维护累积 name / arguments,用于:
+  //   1) 一旦 name 命中 __end_marker 立即从转发出去的 chunk 中剥离该 entry,
+  //      避免客户端看到 marker 工具的存在;
+  //   2) 在 marker 的 arguments 里出现 sentinel 时再 abort 上游(此时业务工具
+  //      arguments 已大概率发完,abort 不会截断业务 tool_call)。
+  type ToolState = { nameBuf: string; argsBuf: string; isMarker: boolean };
+  const toolStates = new Map<number, ToolState>();
+
   const ensureHeadersSent = () => {
     if (headersSent) return;
     if (upstreamGenId) res.setHeader("x-upstream-gen-id", upstreamGenId);
@@ -1152,6 +1231,54 @@ async function pipeWithSavings(
     }
   };
 
+  // 处理单 chunk 的 tool_calls:
+  // - 把命中 __end_marker 的 entry 从 delta.tool_calls 剥离;
+  // - 顺便检测 marker arguments 是否流出 sentinel(命中即标记需要 abort)。
+  // 返回新 chunk(或原 chunk),以及是否触发 args sentinel。
+  const filterToolCalls = (chunk: JsonObject): { chunk: JsonObject; argsSentinel: boolean } => {
+    if (branch !== "tool") return { chunk, argsSentinel: false };
+    const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+    const calls = choice?.delta?.tool_calls;
+    if (!Array.isArray(calls) || calls.length === 0) return { chunk, argsSentinel: false };
+
+    let argsSentinel = false;
+    const filtered: any[] = [];
+    for (const call of calls) {
+      const idx = typeof call.index === "number" ? call.index : 0;
+      let state = toolStates.get(idx);
+      if (!state) {
+        state = { nameBuf: "", argsBuf: "", isMarker: false };
+        toolStates.set(idx, state);
+      }
+      if (typeof call.function?.name === "string" && call.function.name.length > 0) {
+        state.nameBuf += call.function.name;
+        if (
+          state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
+          (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
+            state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME))
+        ) {
+          state.isMarker = true;
+        }
+      }
+      if (typeof call.function?.arguments === "string" && call.function.arguments.length > 0) {
+        state.argsBuf += call.function.arguments;
+        if (state.argsBuf.includes(SAVINGS_SENTINEL_BEGIN)) {
+          state.isMarker = true;
+          argsSentinel = true;
+        }
+      }
+      if (state.isMarker) continue;
+      filtered.push(call);
+    }
+
+    const next = clone(chunk);
+    if (next.choices?.[0]?.delta) {
+      if (filtered.length > 0) next.choices[0].delta.tool_calls = filtered;
+      else delete next.choices[0].delta.tool_calls;
+    }
+    return { chunk: next, argsSentinel };
+  };
+
   try {
     for await (const chunk of parseOpenAISSE(upstream.body)) {
       if (clientClosed || upstreamAborted) break;
@@ -1164,21 +1291,37 @@ async function pipeWithSavings(
       const c = typeof choice?.delta?.content === "string" ? choice.delta.content : "";
       contentBuf += c;
 
+      const { chunk: chunkToQueue, argsSentinel } = filterToolCalls(chunk);
+
       const sentinelIdx = contentBuf.indexOf(SAVINGS_SENTINEL_BEGIN);
       if (sentinelIdx !== -1) {
-        queue.push({ chunk, contentDelta: c });
+        queue.push({ chunk: chunkToQueue, contentDelta: c });
         flushQueue(sentinelIdx, true);
-        logSavings(branch, "sentinel_hit", {
+        logSavings(branch, "text_sentinel_hit", {
           sentinel_offset: sentinelIdx,
           forwarded_bytes: businessBytes,
           ms_since_start: Date.now() - startedAt,
           gen_id: upstreamGenId,
         });
-        closeUpstream("sentinel_hit");
+        closeUpstream("text_sentinel_hit");
         break;
       }
 
-      queue.push({ chunk, contentDelta: c });
+      if (argsSentinel) {
+        // 把已过滤的 chunk(可能仍载有业务工具的 args delta)入队并全量刷出,
+        // 然后 abort 上游,避免后续 marker args 浪费 token。
+        queue.push({ chunk: chunkToQueue, contentDelta: c });
+        flushQueue(contentBuf.length, false);
+        logSavings(branch, "tool_args_sentinel_hit", {
+          forwarded_bytes: businessBytes,
+          ms_since_start: Date.now() - startedAt,
+          gen_id: upstreamGenId,
+        });
+        closeUpstream("tool_args_sentinel_hit");
+        break;
+      }
+
+      queue.push({ chunk: chunkToQueue, contentDelta: c });
       // 安全水位:落后于 contentBuf 末尾 SENTINEL.length 字节
       const safeTo = Math.max(forwardedLen, contentBuf.length - SAVINGS_SENTINEL_BEGIN.length);
       flushQueue(safeTo, false);
@@ -1198,7 +1341,8 @@ async function pipeWithSavings(
       writeRaw(`: x-savings-aborted: ${upstreamAborted ? "1" : "0"}\n\n`);
       writeRaw(`: x-savings-business-bytes: ${businessBytes}\n\n`);
       if (upstreamAborted) {
-        writeRaw(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        const finishReason = branch === "tool" ? "tool_calls" : "stop";
+        writeRaw(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`);
       }
       writeRaw("data: [DONE]\n\n");
       try {
@@ -1546,7 +1690,7 @@ router.post("/chat/completions", async (req, res) => {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
 
     // Streaming savings opt-in:仅当 header 显式打开且条件全部满足才接管,
-    // 任意一条不满足或分支尚未实现都透传到既有路径,绝不悄悄改写非 opt-in 请求。
+    // 任意一条不满足都透传到既有路径,绝不悄悄改写非 opt-in 请求。
     if (req.header(SAVINGS_HEADER) === "1") {
       const branch = chooseSavingsBranch(payload, externalModel);
       if (branch === "text") {
@@ -1554,7 +1698,12 @@ router.post("/chat/completions", async (req, res) => {
         await pipeWithSavings(payload, req, res, "text");
         return;
       }
-      // tool 分支落到 phase 2;其余 ineligible 情况一律 skipped。
+      if (branch === "tool") {
+        injectSavingsToolHandoff(payload);
+        await pipeWithSavings(payload, req, res, "tool");
+        return;
+      }
+      // ineligible(非 stream / 非 Claude / image 模型等)一律标记 skipped 后透传
       res.setHeader(SAVINGS_HEADER, "skipped");
     }
 
