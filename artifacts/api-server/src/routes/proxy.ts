@@ -999,10 +999,12 @@ function buildSavingsTextSystemContent(token: string): string {
   ].join("\n");
 }
 
-// 仅追加一条尾部 system,不动用户原 system,避免破坏 prompt cache 命中。
+// 注入到 messages 首位:多条 system 在 OpenRouter→Anthropic 翻译时会按顺序
+// 拼成单一 system block,unshift 让 handoff 落在 system 块最顶层,模型对它的
+// 服从度更稳定;token 内容是 deterministic 的,后续请求仍能命中 prompt cache。
 function injectSavingsTextHandoff(payload: JsonObject): void {
   if (!Array.isArray(payload.messages)) payload.messages = [];
-  payload.messages.push({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
+  payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
 }
 
 type SavingsBranch = "text" | "tool" | "skip";
