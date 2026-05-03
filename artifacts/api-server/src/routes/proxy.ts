@@ -1018,6 +1018,133 @@ function injectSavingsTextHandoff(payload: JsonObject): void {
   payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
 }
 
+// host field 候选名(优先级由高到低)。语义上偏摘要/说明类的字段被模型放在最后输出
+// 的概率更高,从而最大化"业务字段已经写完才命中 sentinel"的覆盖率。
+const SAVINGS_HOST_FIELD_CANDIDATES = [
+  "summary",
+  "description",
+  "explanation",
+  "analysis",
+  "rationale",
+  "reasoning",
+  "message",
+  "content",
+  "text",
+  "notes",
+  "comment",
+  "result",
+  "answer",
+];
+
+type HostPick =
+  | { level: 1 | 2 | 3; toolName: string; hostField: string; isOptional: boolean }
+  | { level: 4; toolName: string };
+
+type SavingsToolPlan =
+  | { mode: "host"; hosts: Map<string, { hostField: string; level: 1 | 2 | 3 }>; lastToolName?: string }
+  | { mode: "marker" };
+
+// 在工具的 parameters.properties 里挑一个字符串字段作为 host:
+//   L1 = 候选名命中且为 required
+//   L2 = 任意 required string field(取声明顺序最后一个,贴近自然输出末尾)
+//   L3 = optional string field(候选名优先,否则取声明顺序最后一个)
+//   L4 = 整个工具找不到 string 字段 → 整个请求回落到 __end_marker
+// 仅查看顶层 properties,深层嵌套不挖,避免误用难以追加 sentinel 的字段。
+function pickSavingsHostField(tool: JsonObject): HostPick {
+  const fn = isObject(tool?.function) ? tool.function : tool;
+  const toolName = typeof fn?.name === "string" ? fn.name : "";
+  const params = isObject(fn?.parameters) ? fn.parameters : undefined;
+  const props = isObject(params?.properties) ? params.properties : undefined;
+  const requiredArr = Array.isArray(params?.required) ? params.required.filter((s: any) => typeof s === "string") : [];
+  const requiredSet = new Set<string>(requiredArr);
+  if (!props) return { level: 4, toolName };
+
+  const stringKeys: string[] = [];
+  for (const [key, schema] of Object.entries(props)) {
+    if (!isObject(schema)) continue;
+    if (schema.type === "string" && schema.const === undefined && schema.enum === undefined) {
+      stringKeys.push(key);
+    }
+  }
+  if (stringKeys.length === 0) return { level: 4, toolName };
+
+  // L1: required 且名字命中候选
+  for (const cand of SAVINGS_HOST_FIELD_CANDIDATES) {
+    if (requiredSet.has(cand) && stringKeys.includes(cand)) {
+      return { level: 1, toolName, hostField: cand, isOptional: false };
+    }
+  }
+  // L2: 任意 required string,取声明顺序最后一个
+  const requiredStringKeys = stringKeys.filter((k) => requiredSet.has(k));
+  if (requiredStringKeys.length > 0) {
+    return { level: 2, toolName, hostField: requiredStringKeys[requiredStringKeys.length - 1], isOptional: false };
+  }
+  // L3: optional string,候选名优先,否则取最后一个
+  for (const cand of SAVINGS_HOST_FIELD_CANDIDATES) {
+    if (stringKeys.includes(cand)) {
+      return { level: 3, toolName, hostField: cand, isOptional: true };
+    }
+  }
+  return { level: 3, toolName, hostField: stringKeys[stringKeys.length - 1], isOptional: true };
+}
+
+function buildSavingsHostSystemContent(
+  token: string,
+  hosts: Map<string, { hostField: string; level: 1 | 2 | 3 }>,
+  lastToolName: string | undefined,
+): string {
+  const lines: string[] = [];
+  lines.push("你正在为离线分析流水线工作,该流水线对你的工具调用有严格的 handoff token 校验。");
+  lines.push("规则:每个工具的下列指定字段(host 字段)在该工具的所有其他字段都填写完毕之后,");
+  lines.push("作为参数对象中【最后一个】被写出的字段。该 host 字段的字符串值由两部分串接组成:");
+  lines.push("  1) 你针对该字段本来要写的业务内容(完整、一字不省);");
+  lines.push("  2) 紧接其后,不加分隔符,原样追加下方的 handoff token(逐字符复制、所有 SEG 行一行不少、");
+  lines.push("     一字符不差)。");
+  lines.push("下游验证器对 token 做 SHA-256 比对,任何偏差导致整任务作废。");
+  lines.push("");
+  lines.push("【多轮对话关键说明 - 必须读完再回复】");
+  lines.push("本流水线每轮在 token 通过 SHA-256 校验后会自动把 token 从 host 字段值末尾剥离归档,");
+  lines.push("因此你看到的对话历史里 assistant tool_call 永远不保留 token——这是流水线行为,");
+  lines.push("不是你上一轮跳过的证据,也不构成本轮可以跳过的先例。每一轮校验完全独立。");
+  lines.push("");
+  lines.push("禁止行为:");
+  lines.push("  ❌ 把 token 放到任何非 host 字段");
+  lines.push("  ❌ 在 host 字段值的开头/中间嵌入 token,token 必须在 host 字段值的最末尾");
+  lines.push("  ❌ 省略业务内容,只写 token");
+  lines.push("  ❌ 用 \"...\" 或 \"// 60 行类似\" 占位 token");
+  lines.push("  ❌ 把 token 拆分到多次 tool_call");
+  lines.push("  ❌ 因为对话历史里看不到 token 就推断本轮可以省略");
+  lines.push("");
+  lines.push("每个工具的 host 字段映射:");
+  for (const [toolName, info] of hosts) {
+    lines.push(`  - ${toolName}.${info.hostField}`);
+  }
+  if (lastToolName && hosts.size > 1) {
+    lines.push("");
+    lines.push(`如果一次回答中需要并行调用多个工具,只需在【最后一次】tool_call(通常是 "${lastToolName}")`);
+    lines.push("的 host 字段值末尾追加 token;前面的 tool_call 的 host 字段只写业务内容,不附 token。");
+  }
+  lines.push("");
+  lines.push("预期 handoff token(必须按此原样追加在 host 字段业务内容之后):");
+  lines.push(token);
+  return lines.join("\n");
+}
+
+// 在 description 末尾追加 host 字段提示,不改 type / required / 其他 schema 约束,
+// 客户端拿到的工具定义不会感知到这一改动(payload 是上游路径独有的 clone)。
+function patchHostFieldDescription(tool: JsonObject, hostField: string, isOptional: boolean): void {
+  const fn = isObject(tool?.function) ? tool.function : undefined;
+  const params = isObject(fn?.parameters) ? fn.parameters : undefined;
+  const props = isObject(params?.properties) ? params.properties : undefined;
+  const schema = isObject(props?.[hostField]) ? props[hostField] : undefined;
+  if (!schema) return;
+  const prev = typeof schema.description === "string" && schema.description.length > 0 ? schema.description + "\n\n" : "";
+  const note = isOptional
+    ? "PIPELINE: 本字段在本流水线下必须出现,且必须作为本工具参数对象中最后一个被写出的字段。值末尾必须按 system 指令原样追加 handoff token。"
+    : "PIPELINE: 本字段必须作为本工具参数对象中最后一个被写出的字段。值末尾必须按 system 指令原样追加 handoff token。";
+  schema.description = prev + note;
+}
+
 // 工具分支:把 handoff token 编进一个 const string 工具参数里,模型必须 emit
 // 一次 __end_marker(handoff_token=<token>) 才算完成。const schema 让 token 内容
 // 在 prompt 层就被锁定,SHA-256 校验语义沿用文本分支的描述。
@@ -1075,18 +1202,51 @@ function buildSavingsToolSystemContent(token: string): string {
   ].join("\n");
 }
 
-// 工具分支注入:追加 __end_marker 到 tools(append 而不是 unshift,降低被模型
-// 错优先级 emit 的概率);开启 parallel_tool_calls 让模型可在同一轮 emit 业务
-// 工具与 marker;tool_choice 仅在客户端没指定时回落到 "auto",不强制 required。
+// 工具分支注入:优先走 host field 方案 —— 把 sentinel 编进业务工具自身某个 string
+// 字段值的末尾(由 system + description 联合驱动模型),pipe 层在转发时剥离。
+// 仅当至少一个工具找不到可用的 string 字段(L4)时才整请求回落到 __end_marker:
+// 因为 host 与 marker 两套指令并存会让模型行为不可预测。
+const SAVINGS_PLAN = new WeakMap<JsonObject, SavingsToolPlan>();
+
+function getSavingsPlan(payload: JsonObject): SavingsToolPlan | undefined {
+  return SAVINGS_PLAN.get(payload);
+}
+
 function injectSavingsToolHandoff(payload: JsonObject): void {
   const token = getHandoffToken();
   if (!Array.isArray(payload.messages)) payload.messages = [];
-  payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
-
   if (!Array.isArray(payload.tools)) payload.tools = [];
-  payload.tools.push(buildEndMarkerTool(token));
-  payload.parallel_tool_calls = true;
+
+  const picks: HostPick[] = payload.tools.map((t: JsonObject) => pickSavingsHostField(t));
+  const anyL4 = picks.some((p) => p.level === 4);
+
+  if (anyL4 || picks.length === 0) {
+    payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
+    payload.tools.push(buildEndMarkerTool(token));
+    payload.parallel_tool_calls = true;
+    if (!hasOwn(payload, "tool_choice")) payload.tool_choice = "auto";
+    SAVINGS_PLAN.set(payload, { mode: "marker" });
+    return;
+  }
+
+  const hosts = new Map<string, { hostField: string; level: 1 | 2 | 3 }>();
+  for (let i = 0; i < payload.tools.length; i++) {
+    const pick = picks[i] as Exclude<HostPick, { level: 4 }>;
+    const tool = payload.tools[i] as JsonObject;
+    patchHostFieldDescription(tool, pick.hostField, pick.isOptional);
+    if (pick.toolName) hosts.set(pick.toolName, { hostField: pick.hostField, level: pick.level });
+  }
+  const lastTool = payload.tools[payload.tools.length - 1] as JsonObject;
+  const lastFn = isObject(lastTool?.function) ? lastTool.function : undefined;
+  const lastToolName = typeof lastFn?.name === "string" ? lastFn.name : undefined;
+
+  payload.messages.unshift({
+    role: "system",
+    content: buildSavingsHostSystemContent(token, hosts, lastToolName),
+  });
+  if (hosts.size > 1) payload.parallel_tool_calls = true;
   if (!hasOwn(payload, "tool_choice")) payload.tool_choice = "auto";
+  SAVINGS_PLAN.set(payload, { mode: "host", hosts, lastToolName });
 }
 
 type SavingsBranch = "text" | "tool" | "skip";
@@ -1179,11 +1339,21 @@ async function pipeWithSavings(
   let headersSent = false;
 
   // 工具分支按 tool_call.index 维护累积 name / arguments,用于:
-  //   1) 一旦 name 命中 __end_marker 立即从转发出去的 chunk 中剥离该 entry,
-  //      避免客户端看到 marker 工具的存在;
-  //   2) 在 marker 的 arguments 里出现 sentinel 时再 abort 上游(此时业务工具
-  //      arguments 已大概率发完,abort 不会截断业务 tool_call)。
-  type ToolState = { nameBuf: string; argsBuf: string; isMarker: boolean };
+  //   marker mode  → 一旦 name 命中 __end_marker 立即从转发出去的 chunk 中剥离;
+  //                 marker args 出现 sentinel 即 abort 上游。
+  //   host mode    → 每个 tool 的 args 都是业务工具,需要"边转发边检测":在某个
+  //                 host 字段值末尾出现 sentinel 时,把转发的 args 截断到 sentinel
+  //                 之前,再补一个 `"}` 让 JSON 在客户端能正常闭合,然后 abort。
+  const plan = getSavingsPlan(payload);
+  const hostMode = plan?.mode === "host";
+  type ToolState = {
+    nameBuf: string;
+    argsBuf: string;          // 累积到目前为止的 args(原始 raw,含未转发尾部)
+    forwardedLen: number;     // 已经转发给客户端的 args 长度
+    isMarker: boolean;        // marker mode 用:标记此 tool 是 __end_marker
+    finalized: boolean;       // host mode 用:已发完闭合补丁,后续 args delta 全部丢弃
+    name: string;
+  };
   const toolStates = new Map<number, ToolState>();
 
   const ensureHeadersSent = () => {
@@ -1231,10 +1401,11 @@ async function pipeWithSavings(
     }
   };
 
-  // 处理单 chunk 的 tool_calls:
-  // - 把命中 __end_marker 的 entry 从 delta.tool_calls 剥离;
-  // - 顺便检测 marker arguments 是否流出 sentinel(命中即标记需要 abort)。
-  // 返回新 chunk(或原 chunk),以及是否触发 args sentinel。
+  // 处理单 chunk 的 tool_calls。
+  // marker mode:剥离 __end_marker entry,marker args 出现 sentinel → argsSentinel=true。
+  // host mode:对每个 call,在 args delta 上做滑动窗口转发;某个 call 命中 sentinel
+  //   时,把已 forward 的 args 截断到 sentinel 之前,再追加 `"}` 闭合,标记 finalized,
+  //   并设置 argsSentinel=true 让外层 abort。其余尚未命中的 call 继续按窗口正常转发。
   const filterToolCalls = (chunk: JsonObject): { chunk: JsonObject; argsSentinel: boolean } => {
     if (branch !== "tool") return { chunk, argsSentinel: false };
     const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -1247,28 +1418,78 @@ async function pipeWithSavings(
       const idx = typeof call.index === "number" ? call.index : 0;
       let state = toolStates.get(idx);
       if (!state) {
-        state = { nameBuf: "", argsBuf: "", isMarker: false };
+        state = { nameBuf: "", argsBuf: "", forwardedLen: 0, isMarker: false, finalized: false, name: "" };
         toolStates.set(idx, state);
       }
       if (typeof call.function?.name === "string" && call.function.name.length > 0) {
         state.nameBuf += call.function.name;
+        state.name = state.nameBuf;
         if (
-          state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
-          (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
-            state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME))
+          !hostMode &&
+          (state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
+            (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
+              state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME)))
         ) {
           state.isMarker = true;
         }
       }
       if (typeof call.function?.arguments === "string" && call.function.arguments.length > 0) {
         state.argsBuf += call.function.arguments;
+      }
+
+      // marker mode 的旧路径:整 entry 丢弃,marker args 命中 sentinel → abort
+      if (!hostMode) {
         if (state.argsBuf.includes(SAVINGS_SENTINEL_BEGIN)) {
           state.isMarker = true;
           argsSentinel = true;
         }
+        if (state.isMarker) continue;
+        filtered.push(call);
+        continue;
       }
-      if (state.isMarker) continue;
-      filtered.push(call);
+
+      // host mode:已 finalized → 当前 call 余下的 args delta 全部丢弃
+      if (state.finalized) {
+        // 转发该 entry,但 args 字段清空(name / index / id 仍保留以维持 OpenAI 兼容)
+        const stripped = clone(call);
+        if (stripped.function) delete stripped.function.arguments;
+        filtered.push(stripped);
+        continue;
+      }
+
+      // 检测整段 argsBuf 是否含 sentinel
+      const sentinelPos = state.argsBuf.indexOf(SAVINGS_SENTINEL_BEGIN);
+      if (sentinelPos !== -1) {
+        // 命中:把 [forwardedLen, sentinelPos) 这段转发出去,再追加 `"}` 闭合
+        const business = state.argsBuf.slice(state.forwardedLen, sentinelPos);
+        const patched = clone(call);
+        if (!patched.function) patched.function = {};
+        patched.function.arguments = business + '"}';
+        state.forwardedLen = sentinelPos;
+        state.finalized = true;
+        filtered.push(patched);
+        argsSentinel = true;
+        continue;
+      }
+
+      // 未命中:滑动窗口,末尾保留 SENTINEL.length-1 字符不转发
+      const safeLen = Math.max(state.forwardedLen, state.argsBuf.length - (SAVINGS_SENTINEL_BEGIN.length - 1));
+      if (safeLen > state.forwardedLen) {
+        const slice = state.argsBuf.slice(state.forwardedLen, safeLen);
+        const passed = clone(call);
+        if (!passed.function) passed.function = {};
+        passed.function.arguments = slice;
+        state.forwardedLen = safeLen;
+        filtered.push(passed);
+      } else {
+        // 这一 chunk 全部落进窗口 → 不转发任何 args delta,但要保留 name / id 等首发信息
+        const argless = clone(call);
+        if (argless.function) delete argless.function.arguments;
+        // 如果 chunk 里既没 name 又没 id,这条 entry 没有实际意义,跳过
+        if (argless.function?.name || argless.id !== undefined || (state.forwardedLen === 0 && argless.index !== undefined)) {
+          filtered.push(argless);
+        }
+      }
     }
 
     const next = clone(chunk);
@@ -1332,6 +1553,24 @@ async function pipeWithSavings(
     if (!upstreamAborted) {
       // 上游自然收尾且未触发 sentinel:把残留队列全部刷出
       flushQueue(contentBuf.length, false);
+      // host mode:每个 tool 把窗口里残留的 args 尾部一次性刷出去
+      if (hostMode) {
+        for (const [idx, state] of toolStates) {
+          if (state.finalized) continue;
+          if (state.argsBuf.length > state.forwardedLen) {
+            const slice = state.argsBuf.slice(state.forwardedLen);
+            const tail: JsonObject = {
+              choices: [{
+                index: 0,
+                delta: { tool_calls: [{ index: idx, function: { arguments: slice } }] },
+                finish_reason: null,
+              }],
+            };
+            writeChunk(tail);
+            state.forwardedLen = state.argsBuf.length;
+          }
+        }
+      }
     }
 
     if (!res.writableEnded) {
@@ -1732,12 +1971,16 @@ async function pipeWithSavingsAsAnthropic(
     isMarker: boolean;
     started: boolean;
     stopped: boolean;
+    finalized: boolean;       // host mode: 已发完 closing patch 的工具,后续 args delta 全部丢弃
     nameBuf: string;
     argsBuf: string;
+    forwardedLen: number;     // host mode: 已 forward 给客户端的 args 长度
     id: string;
     name: string;
   };
   const toolStates = new Map<string, ToolStateAnthropic>();
+  const plan = getSavingsPlan(payload);
+  const hostMode = plan?.mode === "host";
 
   const startReasoningBlock = () => {
     if (reasoningBlockIndex !== undefined) return reasoningBlockIndex;
@@ -1865,8 +2108,10 @@ async function pipeWithSavingsAsAnthropic(
                 isMarker: false,
                 started: false,
                 stopped: false,
+                finalized: false,
                 nameBuf: "",
                 argsBuf: "",
+                forwardedLen: 0,
                 id: tc.id || `call_${crypto.randomUUID().replace(/-/g, "")}`,
                 name: "",
               };
@@ -1882,9 +2127,10 @@ async function pipeWithSavingsAsAnthropic(
               state.nameBuf += namePart;
               state.name = state.nameBuf;
               if (
-                state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
-                (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
-                  state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME))
+                !hostMode &&
+                (state.nameBuf === SAVINGS_END_MARKER_TOOL_NAME ||
+                  (state.nameBuf.length >= SAVINGS_END_MARKER_TOOL_NAME.length &&
+                    state.nameBuf.startsWith(SAVINGS_END_MARKER_TOOL_NAME)))
               ) {
                 state.isMarker = true;
               }
@@ -1893,38 +2139,91 @@ async function pipeWithSavingsAsAnthropic(
             const argsPart = tc.function?.arguments;
             if (typeof argsPart === "string" && argsPart.length > 0) {
               state.argsBuf += argsPart;
-              if (state.argsBuf.includes(SAVINGS_SENTINEL_BEGIN)) {
+            }
+
+            // marker mode:整 entry 丢弃,marker args 命中 sentinel → abort
+            if (!hostMode) {
+              if (typeof argsPart === "string" && state.argsBuf.includes(SAVINGS_SENTINEL_BEGIN)) {
                 state.isMarker = true;
                 argsSentinelHit = true;
               }
+              if (state.isMarker) continue;
+              if (!state.started) {
+                state.blockIndex = nextContentBlockIndex++;
+                state.started = true;
+                writeAnthropicSSE(res, "content_block_start", {
+                  type: "content_block_start",
+                  index: state.blockIndex,
+                  content_block: { type: "tool_use", id: state.id, name: state.name || "tool", input: {} },
+                });
+              }
+              if (typeof argsPart === "string" && argsPart.length > 0 && state.blockIndex !== undefined) {
+                writeAnthropicSSE(res, "content_block_delta", {
+                  type: "content_block_delta",
+                  index: state.blockIndex,
+                  delta: { type: "input_json_delta", partial_json: argsPart },
+                });
+              }
+              continue;
             }
 
-            if (state.isMarker) continue;
-
-            if (!state.started) {
+            // host mode:始终需要先 emit content_block_start(只要有 name 或已确定将开始)
+            if (!state.started && state.name) {
               state.blockIndex = nextContentBlockIndex++;
               state.started = true;
               writeAnthropicSSE(res, "content_block_start", {
                 type: "content_block_start",
                 index: state.blockIndex,
-                content_block: {
-                  type: "tool_use",
-                  id: state.id,
-                  name: state.name || "tool",
-                  input: {},
-                },
+                content_block: { type: "tool_use", id: state.id, name: state.name, input: {} },
               });
             }
-            if (
-              typeof argsPart === "string" &&
-              argsPart.length > 0 &&
-              state.blockIndex !== undefined
-            ) {
+
+            if (state.finalized) continue;
+
+            // 检测 sentinel
+            const sentinelPos = state.argsBuf.indexOf(SAVINGS_SENTINEL_BEGIN);
+            if (sentinelPos !== -1) {
+              if (state.blockIndex === undefined) {
+                // 极端:还没拿到 name 就命中 sentinel(不应发生);兜底跳过
+                state.finalized = true;
+                argsSentinelHit = true;
+                continue;
+              }
+              const business = state.argsBuf.slice(state.forwardedLen, sentinelPos);
+              const closing = business + '"}';
               writeAnthropicSSE(res, "content_block_delta", {
                 type: "content_block_delta",
                 index: state.blockIndex,
-                delta: { type: "input_json_delta", partial_json: argsPart },
+                delta: { type: "input_json_delta", partial_json: closing },
               });
+              state.forwardedLen = sentinelPos;
+              state.finalized = true;
+              if (!state.stopped) {
+                state.stopped = true;
+                writeAnthropicSSE(res, "content_block_stop", {
+                  type: "content_block_stop",
+                  index: state.blockIndex,
+                });
+              }
+              argsSentinelHit = true;
+              continue;
+            }
+
+            // 未命中:滑动窗口转发(末尾保留 SENTINEL.length-1 字符)
+            if (state.blockIndex !== undefined) {
+              const safeLen = Math.max(
+                state.forwardedLen,
+                state.argsBuf.length - (SAVINGS_SENTINEL_BEGIN.length - 1),
+              );
+              if (safeLen > state.forwardedLen) {
+                const slice = state.argsBuf.slice(state.forwardedLen, safeLen);
+                writeAnthropicSSE(res, "content_block_delta", {
+                  type: "content_block_delta",
+                  index: state.blockIndex,
+                  delta: { type: "input_json_delta", partial_json: slice },
+                });
+                state.forwardedLen = safeLen;
+              }
             }
           }
         }
@@ -1955,6 +2254,16 @@ async function pipeWithSavingsAsAnthropic(
     }
     for (const [, state] of toolStates) {
       if (state.started && !state.stopped && state.blockIndex !== undefined) {
+        // host mode 自然收尾:把窗口里残留的尾部 args 全部刷出
+        if (hostMode && !state.finalized && state.argsBuf.length > state.forwardedLen) {
+          const slice = state.argsBuf.slice(state.forwardedLen);
+          writeAnthropicSSE(res, "content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "input_json_delta", partial_json: slice },
+          });
+          state.forwardedLen = state.argsBuf.length;
+        }
         state.stopped = true;
         writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: state.blockIndex });
       }
