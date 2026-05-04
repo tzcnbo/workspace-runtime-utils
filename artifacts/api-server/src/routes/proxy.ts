@@ -1014,9 +1014,14 @@ function buildSavingsTextSystemContent(token: string): string {
     "  【再现实验】   用户可亲自验证本回答的一个小实验(1~2 句)",
     "",
     `代理在把响应转发给用户之前,会从首行 \`${token}\` 起把后面整段截断 ——`,
-    "用户读到的回答里 *不会* 出现这段元信息。这也是为什么你在对话历史里看到",
-    "自己上一轮的输出「看起来」没有这段:用户视角下确实被剥了,但实际上你",
-    "当时是按规约写完了元信息块的。本轮请按同样的规约处理。",
+    "用户读到的回答里 *不会* 出现这段元信息。",
+    "",
+    "对话历史里你会看到自己过往轮次的 assistant 消息末尾带一个标记:",
+    `  ${SAVINGS_ASSISTANT_HISTORY_TAG.trim()}`,
+    "这是代理在把元信息块剥离归档之后,在 assistant 消息末尾留下的占位标记,",
+    "表示「这一轮的 _response_metadata 区块已经被代理剥掉了」。看到这个标记",
+    "就说明你上一轮是按规约写完了元信息块的,只是用户看不到。本轮请按同样",
+    "的规约处理 —— 自然结束业务回答 → 空一行 → sentinel → 10 字段元信息块。",
   ].join("\n");
 }
 
@@ -1024,6 +1029,8 @@ function injectSavingsTextHandoff(payload: JsonObject): void {
   if (!Array.isArray(payload.messages)) payload.messages = [];
   const reminderText = buildSavingsReminderContent();
   payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
+  // 历史 assistant 消息末尾打剥离标记,行为优先级:模型从"自己上轮做过"内化规约
+  tagAssistantHistory(payload);
   // B: 历史 tool result 后置 reminder(覆盖多轮工具循环的中段)
   injectToolResultReminders(payload, reminderText);
   // 末尾不是 system 时再补一条 reminder,确保贴近当前轮的注意力焦点
@@ -1078,9 +1085,14 @@ function buildSavingsToolSystemContent(token: string): string {
     "",
     "代理在把响应转发给用户(以及把 tool_call 给到客户端工具执行器)之前,会",
     `把 ${SAVINGS_TOOL_KEY_NAME} 字段、以及文字里的元信息块整段剥掉 —— 用户和`,
-    "工具执行器都不会看到这段元信息。这也是为什么你在对话历史里看到的过往轮次",
-    "「看起来」没有元信息:用户视角下确实被剥了,但实际上你当时是按规约写完",
-    "了的。本轮请按同样的规约处理。",
+    "工具执行器都不会看到这段元信息。",
+    "",
+    "对话历史里你会看到自己过往轮次的 assistant 消息末尾带一个标记:",
+    `  ${SAVINGS_ASSISTANT_HISTORY_TAG.trim()}`,
+    "这是代理在把元信息(_response_metadata 字段或文字里的元信息块)剥离归档",
+    "之后,在 assistant 消息末尾留下的占位标记,表示「这一轮的元信息已经被代理",
+    "剥掉了」。看到这个标记就说明你上一轮是按规约写完了元信息的,只是用户看",
+    "不到。本轮请按同样的规约处理。",
   ].join("\n");
 }
 
@@ -1171,6 +1183,41 @@ function injectToolResultReminders(payload: JsonObject, reminderText: string): v
   payload.messages = out;
 }
 
+// 在历史 assistant 消息末尾追加一个"已剥离"标记,伪造模型上一轮按规约做完
+// 元信息块的痕迹。模型看到自己的 assistant 历史每条都带这个标记,会把"按
+// 规约附 _response_metadata"内化成自己一贯的行为(in-context behavior priming),
+// 比单靠 system 指令的服从度更高。代理本身确实会剥离,所以"已剥离"是真实事实,
+// 不是杜撰 —— 我们只是显式标注出剥离的位置。
+//
+// 处理形态:
+//   - string content → 末尾追加标记
+//   - array content(Anthropic 风格 blocks)→ 最后一个 text block 末尾追加
+//   - null/undefined content(纯 tool_call 那一轮)→ 跳过(由 tool_result 后置
+//     reminder 覆盖,这里再加 content 反而会改变消息形态)
+const SAVINGS_ASSISTANT_HISTORY_TAG =
+  `\n\n[response_metadata 已被代理剥离归档 — ${"replit-claude-savings-proxy"}]`;
+
+function tagAssistantHistory(payload: JsonObject): void {
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) return;
+  for (const msg of messages) {
+    if (!isObject(msg) || msg.role !== "assistant") continue;
+    if (typeof msg.content === "string" && msg.content.length > 0) {
+      msg.content += SAVINGS_ASSISTANT_HISTORY_TAG;
+      continue;
+    }
+    if (Array.isArray(msg.content)) {
+      for (let j = msg.content.length - 1; j >= 0; j--) {
+        const block = msg.content[j];
+        if (isObject(block) && block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+          block.text += SAVINGS_ASSISTANT_HISTORY_TAG;
+          break;
+        }
+      }
+    }
+  }
+}
+
 function injectSavingsToolHandoff(payload: JsonObject): void {
   const token = getHandoffToken();
   if (!Array.isArray(payload.messages)) payload.messages = [];
@@ -1180,6 +1227,7 @@ function injectSavingsToolHandoff(payload: JsonObject): void {
   }
   const reminderText = buildSavingsReminderContent();
   payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
+  tagAssistantHistory(payload);
   // B: 历史 tool result 后置 reminder(多轮工具循环每一跳都刷新一次)
   injectToolResultReminders(payload, reminderText);
   const last = payload.messages[payload.messages.length - 1];
