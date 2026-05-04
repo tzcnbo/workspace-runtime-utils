@@ -17,6 +17,12 @@ const SAVINGS_HEADER = "x-savings-mode";
 const SAVINGS_TOKEN_PREFIX = "<<<REPLIT_PROXY_RESPONSE_META_BEGIN>>>";
 const SAVINGS_TOOL_KEY_NAME = "_response_metadata";
 const SAVINGS_TOOL_KEY = '"_response_metadata"';
+// 工具 args 流的安全水位:每次 safe-flush 时在 argsBuf 末尾保留这么多字符不转发,
+// 给 sentinel 检测留足回退空间。值必须 ≥ sentinel 长度 + 模型可能在 sentinel 前
+// 写入的最长前导空白(逗号 + 缩进)。否则 forwardedLen 会越过 cut 位置,导致
+// closing patch 拼出 `{...,}` 这种带尾随逗号的非法 JSON,客户端解析失败
+// (Claude Code 会报 "tool call could not be parsed")。
+const SAVINGS_TOOL_KEY_FLUSH_MARGIN = SAVINGS_TOOL_KEY.length + 32;
 const SAVINGS_PROXY_NAME = "replit-claude-savings-proxy";
 
 const MODEL_MAP: Record<string, string> = {
@@ -1263,6 +1269,38 @@ function mutateChunkContent(chunk: JsonObject, newContent: string): JsonObject {
   return next;
 }
 
+// 在 args 流里定位 sentinel 字段的合法切点。
+//   matched=true  → 命中真实字段。cut 是 closing patch 的截断位置(取 sentinel
+//                   左侧最近的 `,` 或 `{`,跳过中间空白)。
+//   matched=false → 未命中(或都是字符串值里的假阳性)。nextScanFrom 是下一次
+//                   indexOf 起点,已跳过假阳性区段,避免下一轮重复匹配同一处。
+//
+// 假阳性场景:业务字段值刚好等于字面量 "_response_metadata"(例如 grep 工具
+// 把 _response_metadata 当 query 传进来),原始 indexOf 会假命中。我们靠
+// "sentinel 左侧必须是 , 或 { (跳过空白)"过滤,落到其它字符(典型是 :)
+// 就视为字符串内容,跳过继续扫。
+function findSavingsCut(
+  argsBuf: string,
+  scanFrom: number,
+): { matched: boolean; cut: number; nextScanFrom: number } {
+  let from = scanFrom;
+  while (true) {
+    const idx = argsBuf.indexOf(SAVINGS_TOOL_KEY, from);
+    if (idx === -1) return { matched: false, cut: 0, nextScanFrom: from };
+    let cut = idx;
+    let valid = false;
+    while (cut > 0) {
+      cut--;
+      const ch = argsBuf[cut];
+      if (ch === ",") { valid = true; break; }
+      if (ch === "{") { cut++; valid = true; break; }
+      if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") break;
+    }
+    if (valid) return { matched: true, cut, nextScanFrom: from };
+    from = idx + SAVINGS_TOOL_KEY.length;
+  }
+}
+
 async function pipeWithSavings(
   payload: JsonObject,
   req: Request,
@@ -1334,6 +1372,7 @@ async function pipeWithSavings(
     nameBuf: string;
     argsBuf: string;          // 累积到目前为止的 args(原始 raw,含未转发尾部)
     forwardedLen: number;     // 已经转发给客户端的 args 长度
+    scanFrom: number;         // 下一次 sentinel 扫描起点(跳过已判定的假阳性段)
     finalized: boolean;       // 已发完闭合补丁,后续 args delta 全部丢弃
     name: string;
   };
@@ -1399,7 +1438,7 @@ async function pipeWithSavings(
       const idx = typeof call.index === "number" ? call.index : 0;
       let state = toolStates.get(idx);
       if (!state) {
-        state = { nameBuf: "", argsBuf: "", forwardedLen: 0, finalized: false, name: "" };
+        state = { nameBuf: "", argsBuf: "", forwardedLen: 0, scanFrom: 0, finalized: false, name: "" };
         toolStates.set(idx, state);
       }
       if (typeof call.function?.name === "string" && call.function.name.length > 0) {
@@ -1419,31 +1458,26 @@ async function pipeWithSavings(
         continue;
       }
 
-      // 检测 _handoff_token 起始位置
-      const keyIdx = state.argsBuf.indexOf(SAVINGS_TOOL_KEY);
-      if (keyIdx !== -1) {
-        // 向左找最近的 `,` 或 `{`,跳过空白
-        let cut = keyIdx;
-        while (cut > 0) {
-          cut--;
-          const ch = state.argsBuf[cut];
-          if (ch === ",") break;            // 截到 , 处(不含)
-          if (ch === "{") { cut++; break; } // _handoff_token 是首个键 → 截到 { 之后(空对象)
-          if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") break; // 异常,保守截断
-        }
-        const business = state.argsBuf.slice(state.forwardedLen, cut);
+      // 检测 _response_metadata 字段名(带左侧分隔符校验,过滤业务值假阳性)
+      const probe = findSavingsCut(state.argsBuf, state.scanFrom);
+      if (probe.matched) {
+        const business = state.argsBuf.slice(state.forwardedLen, probe.cut);
         const patched = clone(call);
         if (!patched.function) patched.function = {};
         patched.function.arguments = business + "}";
-        state.forwardedLen = cut;
+        state.forwardedLen = probe.cut;
         state.finalized = true;
         filtered.push(patched);
         argsSentinel = true;
         continue;
       }
+      state.scanFrom = probe.nextScanFrom;
 
-      // 未命中:滑动窗口,末尾保留 SAVINGS_TOOL_KEY.length-1 字符不转发
-      const safeLen = Math.max(state.forwardedLen, state.argsBuf.length - (SAVINGS_TOOL_KEY.length - 1));
+      // 未命中:滑动窗口转发,末尾保留足够字符让 sentinel + 前导空白能完整凑齐
+      const safeLen = Math.max(
+        state.forwardedLen,
+        state.argsBuf.length - SAVINGS_TOOL_KEY_FLUSH_MARGIN,
+      );
       if (safeLen > state.forwardedLen) {
         const slice = state.argsBuf.slice(state.forwardedLen, safeLen);
         const passed = clone(call);
@@ -1944,6 +1978,7 @@ async function pipeWithSavingsAsAnthropic(
     nameBuf: string;
     argsBuf: string;
     forwardedLen: number;     // 已 forward 给客户端的 args 长度
+    scanFrom: number;         // 下一次 sentinel 扫描起点(跳过已判定的假阳性段)
     id: string;
     name: string;
   };
@@ -2077,6 +2112,7 @@ async function pipeWithSavingsAsAnthropic(
                 nameBuf: "",
                 argsBuf: "",
                 forwardedLen: 0,
+                scanFrom: 0,
                 id: tc.id || `call_${crypto.randomUUID().replace(/-/g, "")}`,
                 name: "",
               };
@@ -2109,31 +2145,22 @@ async function pipeWithSavingsAsAnthropic(
 
             if (state.finalized) continue;
 
-            // 检测 _handoff_token 字段名起始位置
-            const keyIdx = state.argsBuf.indexOf(SAVINGS_TOOL_KEY);
-            if (keyIdx !== -1) {
+            // 检测 _response_metadata 字段名(带左侧分隔符校验,过滤业务值假阳性)
+            const probe = findSavingsCut(state.argsBuf, state.scanFrom);
+            if (probe.matched) {
               if (state.blockIndex === undefined) {
                 state.finalized = true;
                 argsSentinelHit = true;
                 continue;
               }
-              // 向左找最近的 `,` 或 `{`,跳过空白
-              let cut = keyIdx;
-              while (cut > 0) {
-                cut--;
-                const ch = state.argsBuf[cut];
-                if (ch === ",") break;
-                if (ch === "{") { cut++; break; }
-                if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") break;
-              }
-              const business = state.argsBuf.slice(state.forwardedLen, cut);
+              const business = state.argsBuf.slice(state.forwardedLen, probe.cut);
               const closing = business + "}";
               writeAnthropicSSE(res, "content_block_delta", {
                 type: "content_block_delta",
                 index: state.blockIndex,
                 delta: { type: "input_json_delta", partial_json: closing },
               });
-              state.forwardedLen = cut;
+              state.forwardedLen = probe.cut;
               state.finalized = true;
               if (!state.stopped) {
                 state.stopped = true;
@@ -2145,12 +2172,13 @@ async function pipeWithSavingsAsAnthropic(
               argsSentinelHit = true;
               continue;
             }
+            state.scanFrom = probe.nextScanFrom;
 
-            // 未命中:滑动窗口转发(末尾保留 SAVINGS_TOOL_KEY.length-1 字符)
+            // 未命中:滑动窗口转发,末尾保留 sentinel + 前导空白长度
             if (state.blockIndex !== undefined) {
               const safeLen = Math.max(
                 state.forwardedLen,
-                state.argsBuf.length - (SAVINGS_TOOL_KEY.length - 1),
+                state.argsBuf.length - SAVINGS_TOOL_KEY_FLUSH_MARGIN,
               );
               if (safeLen > state.forwardedLen) {
                 const slice = state.argsBuf.slice(state.forwardedLen, safeLen);
