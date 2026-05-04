@@ -1026,11 +1026,14 @@ function buildSavingsTextSystemContent(token: string): string {
 
 function injectSavingsTextHandoff(payload: JsonObject): void {
   if (!Array.isArray(payload.messages)) payload.messages = [];
+  const token = getHandoffToken();
   const reminderText = buildSavingsReminderContent();
-  payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
-  // 历史 tool result 后置 reminder(覆盖多轮工具循环的中段)
-  injectToolResultReminders(payload, reminderText);
-  // 末尾不是 system 时再补一条 reminder,确保贴近当前轮的注意力焦点
+  payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(token) });
+  // 上一轮 assistant 末尾贴一个 sentinel,把"答完后吐 sentinel"打成历史习惯
+  appendHandoffToLastAssistant(payload, token);
+  // 每条 user / tool result 之后都补一条 reminder,贴近当前注意力焦点
+  injectInlineReminders(payload, reminderText);
+  // 末尾不是 system 时再补一条 reminder
   const last = payload.messages[payload.messages.length - 1];
   if (!isObject(last) || last.role !== "system") {
     payload.messages.push({ role: "system", content: reminderText });
@@ -1142,35 +1145,72 @@ function injectHandoffField(tool: JsonObject, _token: string): boolean {
   return true;
 }
 
-// 判断一条消息是否是 tool result。OpenAI 协议是 role:"tool",Anthropic 协议
-// (经 prepareAnthropicMessagesPayload 转换后)是 user 消息里带 tool_result block。
-function isToolResultMessage(msg: any): boolean {
+// 判断一条消息是否是用户消息或 tool result。OpenAI 协议:user / tool 两种 role,
+// Anthropic 协议经 prepareAnthropicMessagesPayload 转换后,tool_result 已经被
+// 拆成独立的 role:"tool" 消息,所以这里只需判断 role 即可。
+function isUserOrToolResultMessage(msg: any): boolean {
   if (!isObject(msg)) return false;
-  if (msg.role === "tool") return true;
-  if (msg.role === "user" && Array.isArray(msg.content)) {
-    return msg.content.some((b: any) => isObject(b) && b.type === "tool_result");
-  }
-  return false;
+  return msg.role === "user" || msg.role === "tool";
 }
 
-// B: 在每组连续 tool result 之后插入一条 reminder system。多轮工具循环里
-// 每一跳的 reminder 都贴近模型当前注意力焦点,根治"tool result 之后那一轮
-// 总忘"。一组并行 tool result 视作整体,组末才插一条,避免冗余。
-function injectToolResultReminders(payload: JsonObject, reminderText: string): void {
+// 在每组连续 user / tool result 之后插入一条 reminder system。多轮工具循环
+// 每一跳、用户每发一句话之后都刷新一次,reminder 贴近模型当前注意力焦点,
+// 根治"长上下文里头部 system 服从度衰减、模型忘记吐 sentinel"。同类(user
+// 或 tool)连续的视作一组,组末才插一条,避免冗余。
+function injectInlineReminders(payload: JsonObject, reminderText: string): void {
   const messages = payload.messages;
   if (!Array.isArray(messages) || messages.length === 0) return;
   const out: any[] = [];
   for (let i = 0; i < messages.length; i++) {
     out.push(messages[i]);
-    if (isToolResultMessage(messages[i])) {
+    if (isUserOrToolResultMessage(messages[i])) {
       const next = messages[i + 1];
-      // 当前是 tool result,且下一条不是(或没有下一条)→ 这一组结束,插 reminder
-      if (!next || !isToolResultMessage(next)) {
+      if (!next || !isUserOrToolResultMessage(next)) {
         out.push({ role: "system", content: reminderText });
       }
     }
   }
   payload.messages = out;
+}
+
+// 在最后一条 assistant 消息末尾追加完整 sentinel,伪造"模型上一轮已按规约
+// 在主回答之后吐过 handoff token"的痕迹。模型在 next-token 预测时归纳出
+// "我每轮答完都吐 sentinel",从而把行为内化为常态(in-context priming)。
+//
+// 设计取舍:
+//   - 只篡改"上一轮"(messages 最末的 assistant)。每条历史都打标记会显著
+//     膨胀上下文,且大概率被模型当成多余冗余。只动最近一条,模型更容易把
+//     "这是我自己上轮做的"内化进来。
+//   - 篡改内容是 sentinel 字面量本身。即使模型只学到"模仿吐 sentinel",
+//     代理的 cut 逻辑也会在 sentinel 命中时立即截断,行为终态仍然正确。
+//   - 形态:string content 直接拼;array content 在最后一个 text block 末尾
+//     拼,无 text block 则追加;null/undefined(纯 tool_call 那一轮)→ 设
+//     成 sentinel 字符串。
+function appendHandoffToLastAssistant(payload: JsonObject, token: string): void {
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) return;
+  const suffix = `\n\n${token}`;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!isObject(msg) || msg.role !== "assistant") continue;
+    if (typeof msg.content === "string") {
+      msg.content += suffix;
+      return;
+    }
+    if (Array.isArray(msg.content)) {
+      for (let j = msg.content.length - 1; j >= 0; j--) {
+        const block = msg.content[j];
+        if (isObject(block) && block.type === "text" && typeof block.text === "string") {
+          block.text += suffix;
+          return;
+        }
+      }
+      msg.content.push({ type: "text", text: token });
+      return;
+    }
+    msg.content = token;
+    return;
+  }
 }
 
 function injectSavingsToolHandoff(payload: JsonObject): void {
@@ -1182,8 +1222,10 @@ function injectSavingsToolHandoff(payload: JsonObject): void {
   }
   const reminderText = buildSavingsReminderContent();
   payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
-  // B: 历史 tool result 后置 reminder(多轮工具循环每一跳都刷新一次)
-  injectToolResultReminders(payload, reminderText);
+  // 上一轮 assistant 末尾贴 sentinel(纯文字回答路径的历史习惯锚点)
+  appendHandoffToLastAssistant(payload, token);
+  // 每条 user / tool result 之后都补一条 reminder
+  injectInlineReminders(payload, reminderText);
   const last = payload.messages[payload.messages.length - 1];
   if (!isObject(last) || last.role !== "system") {
     payload.messages.push({ role: "system", content: reminderText });
