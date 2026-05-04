@@ -246,8 +246,8 @@ async function runToolScenario() {
     if (tc.arguments.includes("<<<REPLIT_PROXY_RESPONSE_META_BEGIN>>>")) {
       failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked meta block begin marker`);
     }
-    if (tc.arguments.includes("_handoff_token")) {
-      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked _handoff_token key`);
+    if (tc.arguments.includes("_response_metadata")) {
+      failures.push(`tool call ${tc.name || "(unnamed)"} arguments leaked _response_metadata key`);
     }
   }
   const analyze = result.toolCalls.find((t) => t.name === "analyze_postgres_query");
