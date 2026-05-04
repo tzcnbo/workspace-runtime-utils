@@ -1022,10 +1022,15 @@ function buildSavingsTextSystemContent(token: string): string {
 
 function injectSavingsTextHandoff(payload: JsonObject): void {
   if (!Array.isArray(payload.messages)) payload.messages = [];
+  const reminderText = buildSavingsReminderContent();
   payload.messages.unshift({ role: "system", content: buildSavingsTextSystemContent(getHandoffToken()) });
-  // 末尾再追加一条短 reminder system,贴近当前模型注意力焦点(对冲长上下文里
-  // 头部 system 服从度衰减)。
-  payload.messages.push({ role: "system", content: buildSavingsReminderContent() });
+  // B: 历史 tool result 后置 reminder(覆盖多轮工具循环的中段)
+  injectToolResultReminders(payload, reminderText);
+  // 末尾不是 system 时再补一条 reminder,确保贴近当前轮的注意力焦点
+  const last = payload.messages[payload.messages.length - 1];
+  if (!isObject(last) || last.role !== "system") {
+    payload.messages.push({ role: "system", content: reminderText });
+  }
 }
 
 // 工具分支 system prompt:同样的"答案元信息"框架,拆两条路径:
@@ -1095,6 +1100,10 @@ function buildSavingsReminderContent(): string {
 // 客户端发的原 schema 不会被改(payload 是 server-side clone)。上游模型看到
 // 的 schema 多一个结构化元信息字段,响应的 args 由 pipe 层在检测到字段名时
 // 立即抢断,实际子字段内容并不会真的生成。
+//
+// 同时在 function.description 末尾追加一句代理协议提醒 —— 模型在【选工具】
+// 的瞬间(读 tool list)就会被提醒,而不是要等到吐 args 时才回头看头部 system,
+// 显著降低多轮对话后忘记附 _response_metadata 的概率。
 function injectHandoffField(tool: JsonObject, _token: string): boolean {
   const fn = isObject(tool?.function) ? tool.function : undefined;
   if (!fn) return false;
@@ -1121,7 +1130,45 @@ function injectHandoffField(tool: JsonObject, _token: string): boolean {
   };
   if (!Array.isArray(params.required)) params.required = [];
   if (!params.required.includes(SAVINGS_TOOL_KEY_NAME)) params.required.push(SAVINGS_TOOL_KEY_NAME);
+
+  // A: 在 description 末尾追加协议提醒,让模型在选工具时就看到要求
+  const prevDesc = typeof fn.description === "string" ? fn.description : "";
+  const proxyNote =
+    `\n\n[${SAVINGS_PROXY_NAME}] 调用本工具时,arguments 对象的最末一个字段必须是 ${SAVINGS_TOOL_KEY_NAME}` +
+    `(代理协议必填,字段模板见首部 system)。代理在转发到工具执行器前会自动剥离此字段。`;
+  fn.description = prevDesc + proxyNote;
   return true;
+}
+
+// 判断一条消息是否是 tool result。OpenAI 协议是 role:"tool",Anthropic 协议
+// (经 prepareAnthropicMessagesPayload 转换后)是 user 消息里带 tool_result block。
+function isToolResultMessage(msg: any): boolean {
+  if (!isObject(msg)) return false;
+  if (msg.role === "tool") return true;
+  if (msg.role === "user" && Array.isArray(msg.content)) {
+    return msg.content.some((b: any) => isObject(b) && b.type === "tool_result");
+  }
+  return false;
+}
+
+// B: 在每组连续 tool result 之后插入一条 reminder system。多轮工具循环里
+// 每一跳的 reminder 都贴近模型当前注意力焦点,根治"tool result 之后那一轮
+// 总忘"。一组并行 tool result 视作整体,组末才插一条,避免冗余。
+function injectToolResultReminders(payload: JsonObject, reminderText: string): void {
+  const messages = payload.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return;
+  const out: any[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    out.push(messages[i]);
+    if (isToolResultMessage(messages[i])) {
+      const next = messages[i + 1];
+      // 当前是 tool result,且下一条不是(或没有下一条)→ 这一组结束,插 reminder
+      if (!next || !isToolResultMessage(next)) {
+        out.push({ role: "system", content: reminderText });
+      }
+    }
+  }
+  payload.messages = out;
 }
 
 function injectSavingsToolHandoff(payload: JsonObject): void {
@@ -1131,8 +1178,14 @@ function injectSavingsToolHandoff(payload: JsonObject): void {
   for (const tool of payload.tools) {
     injectHandoffField(tool as JsonObject, token);
   }
+  const reminderText = buildSavingsReminderContent();
   payload.messages.unshift({ role: "system", content: buildSavingsToolSystemContent(token) });
-  payload.messages.push({ role: "system", content: buildSavingsReminderContent() });
+  // B: 历史 tool result 后置 reminder(多轮工具循环每一跳都刷新一次)
+  injectToolResultReminders(payload, reminderText);
+  const last = payload.messages[payload.messages.length - 1];
+  if (!isObject(last) || last.role !== "system") {
+    payload.messages.push({ role: "system", content: reminderText });
+  }
   if (!hasOwn(payload, "tool_choice")) payload.tool_choice = "auto";
 }
 
