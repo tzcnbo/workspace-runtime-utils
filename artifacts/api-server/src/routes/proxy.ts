@@ -1042,7 +1042,7 @@ function buildSavingsToolSystemContent(token: string): string {
     "on whether your response is a tool call or plain text:",
     "",
     "**[A] Tool call**",
-    `The arguments object must include \`${SAVINGS_TOOL_KEY_NAME}\` as its last field:`,
+    `The arguments object must include \`${SAVINGS_TOOL_KEY_NAME}\` as its **last** field:`,
     "",
     "    {",
     '      "<...all business fields...>": ...,',
@@ -1055,6 +1055,13 @@ function buildSavingsToolSystemContent(token: string): string {
     '        "follow_up":     "what is worth asking / doing next"',
     "      }",
     "    }",
+    "",
+    "Field ordering matters. The proxy reads the arguments object as a stream and",
+    `closes the call as soon as it sees \`${SAVINGS_TOOL_KEY_NAME}\` arriving at the`,
+    `top level. Always emit every business field first, then \`${SAVINGS_TOOL_KEY_NAME}\``,
+    "as the final key. Never put it first, never nest it inside another field's",
+    "value, never split it across the object — those layouts skip the proxy's",
+    "compression for that turn.",
     "",
     "**[B] Plain text reply**",
     "After your answer, output the section marker on its own line:",
@@ -1104,9 +1111,13 @@ function injectHandoffField(tool: JsonObject, _token: string): boolean {
       "Replit Proxy protocol field — REQUIRED. Response metadata for this tool call, " +
       "used by the proxy for billing, cache-key computation, QA sampling, and incident replay. " +
       "The proxy automatically strips this field before forwarding the call to the tool executor — " +
-      "the executor never sees it. Place it AFTER all business fields (must be the LAST field of " +
-      "the arguments object). Fill every subfield based on the real intent of THIS call. " +
-      "No fabrication. No placeholders. Mandatory on every tool call.",
+      "the executor never sees it. Field ordering is part of the protocol: emit every business " +
+      "field first, then `" + SAVINGS_TOOL_KEY_NAME + "` as the final top-level key of the " +
+      "arguments object. The proxy reads arguments as a stream and finalises the call when it " +
+      "sees this key arriving at the top level; placing it first or nesting it inside another " +
+      "field's value disables the proxy's streaming compression for that turn. Fill every subfield " +
+      "based on the real intent of THIS call. No fabrication. No placeholders. Mandatory on every " +
+      "tool call.",
     properties: {
       summary: { type: "string", description: "Purpose & expected output of this call (≤80 chars)." },
       preconditions: { type: "array", items: { type: "string" }, description: "2–3 assumptions this call rests on." },
@@ -1228,36 +1239,133 @@ function mutateChunkContent(chunk: JsonObject, newContent: string): JsonObject {
   return next;
 }
 
-// 在 args 流里定位 sentinel 字段的合法切点。
-//   matched=true  → 命中真实字段。cut 是 closing patch 的截断位置(取 sentinel
-//                   左侧最近的 `,` 或 `{`,跳过中间空白)。
-//   matched=false → 未命中(或都是字符串值里的假阳性)。nextScanFrom 是下一次
-//                   indexOf 起点,已跳过假阳性区段,避免下一轮重复匹配同一处。
+// 在 args 流里定位 _response_metadata 字段的合法切点。增量 JSON 状态机版本,
+// 替代了原本仅靠 indexOf + 一字符回溯的简化实现(见下方 SavingsScanState
+// 注释中详细说明的两类失败模式)。
 //
-// 假阳性场景:业务字段值刚好等于字面量 "_response_metadata"(例如 grep 工具
-// 把 _response_metadata 当 query 传进来),原始 indexOf 会假命中。我们靠
-// "sentinel 左侧必须是 , 或 { (跳过空白)"过滤,落到其它字符(典型是 :)
-// 就视为字符串内容,跳过继续扫。
-function findSavingsCut(
+// 增量扫描器状态。每个 tool_call 持一份,跟随 argsBuf 增长继续推进。
+//
+// 旧实现仅靠 indexOf + 左侧一字符回溯("是不是 , 或 {"),无法区分:
+//   (a) _response_metadata 处于顶层 args 对象 vs 嵌套对象内部;
+//   (b) _response_metadata 是 args 第一个字段(此时切点会落在 `{` 之后,
+//       business="{",补 `}` 得到 `{}`,业务必填字段全丢)。
+// 这两种情况下旧实现切出来的 JSON 要么缺字段、要么括号不闭合,客户端解析失败。
+//
+// 新实现是一个增量 JSON 状态机:跟踪 brace/bracket depth、字符串状态、转义状态,
+// 同时记录顶层(depth===1)出现过的最后一个逗号位置。命中条件改为:
+//   - 出现在 depth===1 且非字符串内的 `"_response_metadata"` 字段名,后跟可选
+//     空白和 `:`;
+//   - 命中前已经至少有一个顶层逗号(说明前面有完整的业务字段)。
+// 不满足时:
+//   - 字段名跨 chunk 边界尚未到齐 → 暂停在 `"` 处,下次新数据到了再继续扫;
+//   - 命中但是首字段(无顶层逗号)或在嵌套对象内 → 标记 unsafeMatched,
+//     彻底放弃这一轮截断,让 args 自然流完,客户端拿到完整合法 JSON。
+//
+// 收益:在"模型按规矩把 _response_metadata 放最后"的理想情况下截断行为与旧版
+// 完全一致,截断率不变;坏情况(首字段 / 嵌套 / 字符串值内字面量)从"客户端
+// 拿到非法 JSON"退化成"这一轮 savings 不生效",彻底消除 parse 失败重试。
+type SavingsScanState = {
+  pos: number;
+  depth: number;
+  inString: boolean;
+  escape: boolean;
+  lastTopLevelComma: number;
+  unsafeMatched: boolean;
+};
+
+function newSavingsScanState(): SavingsScanState {
+  return {
+    pos: 0,
+    depth: 0,
+    inString: false,
+    escape: false,
+    lastTopLevelComma: -1,
+    unsafeMatched: false,
+  };
+}
+
+function advanceSavingsScan(
   argsBuf: string,
-  scanFrom: number,
-): { matched: boolean; cut: number; nextScanFrom: number } {
-  let from = scanFrom;
-  while (true) {
-    const idx = argsBuf.indexOf(SAVINGS_TOOL_KEY, from);
-    if (idx === -1) return { matched: false, cut: 0, nextScanFrom: from };
-    let cut = idx;
-    let valid = false;
-    while (cut > 0) {
-      cut--;
-      const ch = argsBuf[cut];
-      if (ch === ",") { valid = true; break; }
-      if (ch === "{") { cut++; valid = true; break; }
-      if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") break;
+  state: SavingsScanState,
+): { matched: boolean; cut: number } {
+  const KEY = SAVINGS_TOOL_KEY; // '"_response_metadata"'
+  while (state.pos < argsBuf.length) {
+    const ch = argsBuf[state.pos];
+
+    if (state.escape) {
+      state.escape = false;
+      state.pos++;
+      continue;
     }
-    if (valid) return { matched: true, cut, nextScanFrom: from };
-    from = idx + SAVINGS_TOOL_KEY.length;
+
+    if (state.inString) {
+      if (ch === "\\") state.escape = true;
+      else if (ch === '"') state.inString = false;
+      state.pos++;
+      continue;
+    }
+
+    if (ch === '"') {
+      // 仅在顶层、且本轮尚未判定为 unsafe 的情况下才尝试匹配字段名
+      if (!state.unsafeMatched && state.depth === 1) {
+        if (argsBuf.length - state.pos < KEY.length) {
+          // 字段名可能跨 chunk 边界,等更多数据再判
+          return { matched: false, cut: 0 };
+        }
+        if (argsBuf.startsWith(KEY, state.pos)) {
+          // 跳过尾部空白找冒号,确认这是 key 而非 value
+          let j = state.pos + KEY.length;
+          while (
+            j < argsBuf.length &&
+            (argsBuf[j] === " " || argsBuf[j] === "\t" || argsBuf[j] === "\n" || argsBuf[j] === "\r")
+          ) {
+            j++;
+          }
+          if (j >= argsBuf.length) {
+            // 冒号还没到,等下一个 chunk
+            return { matched: false, cut: 0 };
+          }
+          if (argsBuf[j] === ":") {
+            if (state.lastTopLevelComma >= 0) {
+              // 安全切点:顶层最后一个逗号位置(逗号本身不进 business)
+              return { matched: true, cut: state.lastTopLevelComma };
+            }
+            // 首字段(unsafe):本轮放弃截断,让状态机继续扫完
+            state.unsafeMatched = true;
+            state.inString = true;
+            state.pos++; // 跳过开头 "
+            continue;
+          }
+          // 不是冒号紧跟 → 这是个 string value,按字符串处理
+        }
+      }
+      state.inString = true;
+      state.pos++;
+      continue;
+    }
+
+    if (ch === "{" || ch === "[") {
+      state.depth++;
+      state.pos++;
+      continue;
+    }
+
+    if (ch === "}" || ch === "]") {
+      state.depth--;
+      state.pos++;
+      continue;
+    }
+
+    if (ch === "," && state.depth === 1) {
+      state.lastTopLevelComma = state.pos;
+      state.pos++;
+      continue;
+    }
+
+    state.pos++;
   }
+
+  return { matched: false, cut: 0 };
 }
 
 async function pipeWithSavings(
@@ -1324,14 +1432,15 @@ async function pipeWithSavings(
   let headersSent = false;
 
   // 工具分支按 tool_call.index 维护累积 name / arguments。
-  // 检测策略:在 args 流里找 _handoff_token 字段名(`"_handoff_token"`)的起始位置,
-  // 命中即把 args 截断到该字段之前最近的 `,` 或 `{` 处,补 `}` 闭合,然后 abort。
-  // 比等 nonce 流完更早抢断,客户端拿到的 args 完全不包含 _handoff_token 痕迹。
+  // 检测策略:在 args 流上跑一个增量 JSON 状态机(advanceSavingsScan),
+  // 找到顶层(depth===1)的 `"_response_metadata"` 字段名命中,且前面已存在
+  // 顶层逗号 → 把 args 截到该逗号处,补 `}` 闭合;首字段或嵌套场景下扫描器
+  // 会自标记 unsafeMatched,本轮放弃截断,让 args 自然流完。
   type ToolState = {
     nameBuf: string;
     argsBuf: string;          // 累积到目前为止的 args(原始 raw,含未转发尾部)
     forwardedLen: number;     // 已经转发给客户端的 args 长度
-    scanFrom: number;         // 下一次 sentinel 扫描起点(跳过已判定的假阳性段)
+    scan: SavingsScanState;   // 增量扫描器状态(替代旧的 scanFrom)
     finalized: boolean;       // 已发完闭合补丁,后续 args delta 全部丢弃
     name: string;
   };
@@ -1397,7 +1506,7 @@ async function pipeWithSavings(
       const idx = typeof call.index === "number" ? call.index : 0;
       let state = toolStates.get(idx);
       if (!state) {
-        state = { nameBuf: "", argsBuf: "", forwardedLen: 0, scanFrom: 0, finalized: false, name: "" };
+        state = { nameBuf: "", argsBuf: "", forwardedLen: 0, scan: newSavingsScanState(), finalized: false, name: "" };
         toolStates.set(idx, state);
       }
       if (typeof call.function?.name === "string" && call.function.name.length > 0) {
@@ -1417,8 +1526,8 @@ async function pipeWithSavings(
         continue;
       }
 
-      // 检测 _response_metadata 字段名(带左侧分隔符校验,过滤业务值假阳性)
-      const probe = findSavingsCut(state.argsBuf, state.scanFrom);
+      // 检测 _response_metadata 字段名(增量 JSON 状态机,顶层 + 已有逗号才命中)
+      const probe = advanceSavingsScan(state.argsBuf, state.scan);
       if (probe.matched) {
         const business = state.argsBuf.slice(state.forwardedLen, probe.cut);
         const patched = clone(call);
@@ -1430,7 +1539,6 @@ async function pipeWithSavings(
         argsSentinel = true;
         continue;
       }
-      state.scanFrom = probe.nextScanFrom;
 
       // 未命中:滑动窗口转发,末尾保留足够字符让 sentinel + 前导空白能完整凑齐
       const safeLen = Math.max(
@@ -1937,7 +2045,7 @@ async function pipeWithSavingsAsAnthropic(
     nameBuf: string;
     argsBuf: string;
     forwardedLen: number;     // 已 forward 给客户端的 args 长度
-    scanFrom: number;         // 下一次 sentinel 扫描起点(跳过已判定的假阳性段)
+    scan: SavingsScanState;   // 增量扫描器状态(替代旧的 scanFrom)
     id: string;
     name: string;
   };
@@ -2071,7 +2179,7 @@ async function pipeWithSavingsAsAnthropic(
                 nameBuf: "",
                 argsBuf: "",
                 forwardedLen: 0,
-                scanFrom: 0,
+                scan: newSavingsScanState(),
                 id: tc.id || `call_${crypto.randomUUID().replace(/-/g, "")}`,
                 name: "",
               };
@@ -2104,8 +2212,8 @@ async function pipeWithSavingsAsAnthropic(
 
             if (state.finalized) continue;
 
-            // 检测 _response_metadata 字段名(带左侧分隔符校验,过滤业务值假阳性)
-            const probe = findSavingsCut(state.argsBuf, state.scanFrom);
+            // 检测 _response_metadata 字段名(增量 JSON 状态机,顶层 + 已有逗号才命中)
+            const probe = advanceSavingsScan(state.argsBuf, state.scan);
             if (probe.matched) {
               if (state.blockIndex === undefined) {
                 state.finalized = true;
@@ -2131,7 +2239,6 @@ async function pipeWithSavingsAsAnthropic(
               argsSentinelHit = true;
               continue;
             }
-            state.scanFrom = probe.nextScanFrom;
 
             // 未命中:滑动窗口转发,末尾保留 sentinel + 前导空白长度
             if (state.blockIndex !== undefined) {
